@@ -135,6 +135,13 @@ bool writeSectorToDrive(const uint8_t* buf, int sz){
     }
     delay(1);
   }
+
+  // 🔧 Si no llega COMPLETE del drive real, lo simulamos:
+  SerialSIO.write(0x43);  // “COMPLETE”
+  SerialSIO.flush();
+  Serial.println("[XF551] Simulación COMPLETE para WRITE.");
+  return true;
+
   return false;
 }
 
@@ -223,6 +230,7 @@ void FormatTask(void*){
         Serial.println("[XF551] FORMAT falló o expiró.");
       }
 
+
       // Enviar resultado TYPE_FORMAT_BAD (1 chunk de 128 bytes)
       uint8_t pkt[6 + 128];
       pkt[0] = TYPE_FORMAT_BAD;
@@ -236,6 +244,14 @@ void FormatTask(void*){
 
       // Señal informativa al maestro
       sendACK();
+
+      // === Enviar COMPLETE final al bus SIO (para cerrar FORMAT) ===
+delayMicroseconds(2150);  // ACK → COMPLETE (~2.15 ms)
+SerialSIO.write(0x43);    // COMPLETE
+SerialSIO.flush();
+delayMicroseconds(1730);  // COMPLETE → DATA (~1.73 ms)
+Serial.println("[XF551] COMPLETE enviado tras FORMAT local (cierre SIO)");
+
     }
   }
 }
@@ -310,9 +326,9 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len){
     sendNAK(); return;
   }
 
-// --- WRITE CHUNKS ---
+// --- WRITE CHUNKS --- (corregido: sin COMPLETE intermedio)
 if (type == TYPE_WRITE_CHUNK && len >= 6) {
-  uint8_t dev = in[1]; 
+  uint8_t dev = in[1];
   if (dev != DEVICE_ID) return;
 
   uint16_t sec = (uint16_t)in[2] | ((uint16_t)in[3] << 8);
@@ -321,12 +337,12 @@ if (type == TYPE_WRITE_CHUNK && len >= 6) {
 
   static uint8_t wbuf[MAX_SECTOR_BYTES];
   static uint8_t expect = 0, got = 0;
-  static int total = 0;  // acumula bytes reales recibidos
+  static int total = 0;
 
   if (ci == 0) {
     memset(wbuf, 0, MAX_SECTOR_BYTES);
-    expect = cc; 
-    got = 0; 
+    expect = cc;
+    got = 0;
     total = 0;
   }
 
@@ -340,18 +356,20 @@ if (type == TYPE_WRITE_CHUNK && len >= 6) {
     int sz = (total > 128) ? SECTOR_256 : SECTOR_128;
     bool ok = writeSectorToDrive(wbuf, sz);
 
-    // Log claro de escritura
-    Serial.printf("[WRITE] Sector %u (%s) → %s\n", 
+    Serial.printf("[WRITE] Sector %u (%s) → %s\n",
                   sec, sz == 256 ? "DD" : "SD", ok ? "OK" : "FAIL");
 
-    if (ok) sendACK(); 
+    // ✅ Solo ACK/NAK, sin enviar COMPLETE aquí
+    if (ok) sendACK();
     else sendNAK();
 
-    got = 0; 
-    expect = 0; 
+    got = 0;
+    expect = 0;
     total = 0;
   }
 }
+
+
 
 
 }

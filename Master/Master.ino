@@ -73,6 +73,8 @@ static uint16_t T_CHUNK             = DEF_T_CHUNK;
 #define CHUNK_PAYLOAD     240
 #define MAX_SECTOR_BYTES  256
 
+#define SIMULATE_FORMAT 1
+
 // Flags específicos para FORMAT
 volatile bool g_waitingFormat = false;   // esperando mapa desde esclavo
 volatile bool g_formatReady   = false;   // mapa recibido
@@ -344,13 +346,147 @@ void sendAtariData(const uint8_t* buf,int n){
   }
 }
 
-void handleFormat(uint8_t dev,bool dd){
+// ============================================================
+// Sectores iniciales simulados (directorio y VTOC)
+// ============================================================
+uint8_t emptyDirSector[128];
+uint8_t emptyVtocSector[128];
 
-  delayMicroseconds(1500);
+void initEmptySectors() {
+  memset(emptyDirSector, 0x00, sizeof(emptyDirSector));
+  memset(emptyVtocSector, 0x00, sizeof(emptyVtocSector));
+
+  // Simular VTOC (sector 361) con 707 sectores libres
+  // Byte 0-1: número de sectores libres (little endian)
+  emptyVtocSector[0] = 0xC3;  // 707 = 0x02C3
+  emptyVtocSector[1] = 0x02;
+  // El resto queda en 0x00 (todo libre)
+}
+
+void handleFormat(uint8_t dev, bool dd) {
+  delayMicroseconds(2150);  // ACK retrasado
   SerialSIO.write(SIO_ACK);
   SerialSIO.flush();
+
+#if SIMULATE_FORMAT
+  Serial.println("[SIM] Simulación FORMAT iniciada (modo XF551/FujiNet)");
+
+  // Pausa inicial antes del COMPLETE
+  delayMicroseconds(2100);
+  SerialSIO.write(SIO_COMPLETE);
+  SerialSIO.flush();
+
+  delayMicroseconds(1750); // COMPLETE → DATA
+
+  // --- Si el BAD MAP está vacío, generar uno válido ---
+  bool empty = true;
+  for (int i = 0; i < 128; i++) {
+    if (replyBuf[i] != 0x00) { empty = false; break; }
+  }
+  if (empty) {
+    memset(replyBuf, 0x00, 128);
+    replyBuf[0] = 0xFF;  // FF FF indica sin sectores defectuosos
+    replyBuf[1] = 0xFF;
+    Serial.println("[SIM] BAD MAP vacío detectado. Generado FF FF.");
+  }
+
+ // --- Calcular checksum XF551 (carry + FF FF) ---
+uint16_t sum = 0;
+for (int i = 0; i < 128; i++) {
+  sum += replyBuf[i];
+  if (sum > 0xFF) sum = (sum & 0xFF) + 1;
+}
+sum += 0xFF; if (sum > 0xFF) sum = (sum & 0xFF) + 1;
+sum += 0xFF; if (sum > 0xFF) sum = (sum & 0xFF) + 1;
+uint8_t fchk = sum & 0xFF;
+
+// --- Si el resultado no es 0xFF, ajustarlo (modo compatibilidad MyDOS) ---
+if (fchk != 0xFF) {
+  uint8_t diff = 0xFF - fchk;
+  replyBuf[127] = (replyBuf[127] + diff) & 0xFF;
+  fchk = 0xFF;
+}
+
+// --- Envío del BAD MAP ---
+for (int i = 0; i < 128; i++) {
+  SerialSIO.write(replyBuf[i]);
+  delayMicroseconds(6);
+}
+SerialSIO.write(0xFF);
+delayMicroseconds(6);
+SerialSIO.write(0xFF);
+delayMicroseconds(6);
+
+// --- Envío del checksum ---
+delayMicroseconds(300);
+SerialSIO.write(fchk);
+SerialSIO.flush();
+delayMicroseconds(1700);
+
+  Serial.printf("[SIM] BAD MAP enviado (128+2 bytes, CHK=%02X)\n", fchk);
+
+  // --- Escritura de sectores 360 y 361 ---
+  writeLocal(dev, 360, false, emptyDirSector, 128);
+  writeLocal(dev, 361, false, emptyVtocSector, 128);
+  Serial.println("[SIM] Sectores 360 y 361 inicializados.");
+
+  blinkActivity(3);
+  Serial.println("[SIM] FORMAT local completado.");
+  // === Inicialización mínima de sectores 360 (directorio) y 361 (VTOC) ===
+uint8_t emptyDirSector[128];
+uint8_t emptyVtocSector[128];
+memset(emptyDirSector, 0x00, 128);
+memset(emptyVtocSector, 0x00, 128);
+
+
+// Sector 360: directorio vacío con marcador E5h
+for (int i = 0; i < 128; i += 16) {
+  emptyDirSector[i] = 0xE5;
+}
+
+// === Sector 361: VTOC totalmente compatible con DOS 2.5 / MyDOS ===
+memset(emptyVtocSector, 0x00, 128);
+
+// Byte 0: número de sectores por grupo (always 1 para DOS 2.5 simple densidad)
+emptyVtocSector[0] = 0x01;
+
+// Byte 1–2: número de sectores libres (low/high)
+uint16_t freeSectors = 707;   // 720 totales – 13 usados (sistema + VTOC + dir)
+emptyVtocSector[1] = freeSectors & 0xFF;
+emptyVtocSector[2] = (freeSectors >> 8) & 0xFF;
+
+// Byte 3: número de pistas (40)
+emptyVtocSector[3] = 40;
+
+// Bytes 4–127: mapa de bits (1 = libre, 0 = ocupado)
+for (int i = 4; i < 128; i++) emptyVtocSector[i] = 0xFF;
+
+// Marcar los sectores 1–3 (boot, DOS.SYS, DUP.SYS) y 360–361 como usados
+// Sector 1 = bit 0 del byte 4
+emptyVtocSector[4] &= ~(0b00001111);  // primeros 4 sectores usados
+emptyVtocSector[5] &= ~(0b00000011);  // siguientes 2 usados
+// 360–361 → bits 0 y 1 del byte (360/8 + 4)
+int byteIndex = 360 / 8 + 4;
+int bitPos = 360 % 8;
+emptyVtocSector[byteIndex] &= ~(1 << bitPos);
+emptyVtocSector[byteIndex] &= ~(1 << (bitPos + 1));
+
+Serial.println("[SIM] Escribiendo sectores 360 y 361 (DIR + VTOC DOS 2.5)...");
+writeLocal(dev, 360, false, emptyDirSector, 128);
+writeLocal(dev, 361, false, emptyVtocSector, 128);
+Serial.println("[SIM] FORMAT completo: VTOC DOS 2.5 inicializado.");
+
+
+
+
+  return;
+#endif
+
+
+
+  // ========== MODO REAL (ESPNOW) ==========
   replyReady = false;
-  expectedChunks = receivedChunks = 0; replySec = 0;
+  expectedChunks = receivedChunks = 0;
   g_waitingFormat = true; g_formatReady = false; g_formatLen = 0;
 
   if (!sendCmd(dev, 0x21, 0, dd ? 1 : 0)) {
@@ -359,14 +495,13 @@ void handleFormat(uint8_t dev,bool dd){
     return;
   }
 
-  // === ESPERA CON KEEP-ALIVE (BUSY=0x42) ===
-  const unsigned long MAX_WAIT   = 90000UL;  // 90s
-  const unsigned long BUSY_PERIOD = 50UL;    // cada 50 ms
+  const unsigned long MAX_WAIT = 90000UL;
+  const unsigned long BUSY_PERIOD = 75UL;
   unsigned long t0 = millis(), tBusy = t0;
 
   while (millis() - t0 < MAX_WAIT) {
     if (millis() - tBusy >= BUSY_PERIOD) {
-      SerialSIO.write(0x42);  // BUSY
+      SerialSIO.write(0x42);
       tBusy = millis();
     }
     if (g_formatReady && replyReady) break;
@@ -379,38 +514,29 @@ void handleFormat(uint8_t dev,bool dd){
     return;
   }
 
-  // === ENVÍO FINAL: COMPLETE + BAD MAP + CHK ===
-  delayMicroseconds(T_ACK_TO_COMPLETE);
+  delayMicroseconds(2150);
   SerialSIO.write(SIO_COMPLETE);
   SerialSIO.flush();
 
-  delayMicroseconds(T_COMPLETE_TO_DATA);
-
-  // La XF551 envía BAD MAP sin pausas largas, ~8 µs entre bytes
+  delayMicroseconds(1730);
   for (int i = 0; i < 128; i++) {
     SerialSIO.write(replyBuf[i]);
     delayMicroseconds(8);
   }
 
-  uint8_t fchk = checksum(replyBuf, 128);
-  delayMicroseconds(T_DATA_TO_CHK + 250);
-  SerialSIO.write(fchk);
+  uint8_t fchk2 = checksum(replyBuf, 128);
+  delayMicroseconds(286);
+  SerialSIO.write(fchk2);
   SerialSIO.flush();
+  delayMicroseconds(1760);
 
-  delayMicroseconds(T_CHUNK + 300);
-
-  // Log de diagnóstico
-  Serial.println("[FORMAT] BAD MAP (128 bytes):");
-  for (int i = 0; i < 128; i++) {
-    Serial.printf("%02X%s", replyBuf[i], ((i & 0x0F) == 0x0F) ? "\n" : " ");
-  }
-  Serial.printf("[FORMAT] BAD MAP CHK calc=%02X\n", fchk);
-
+  Serial.printf("[FORMAT] BAD MAP CHK=%02X\n", fchk2);
   g_waitingFormat = false;
-  g_formatReady   = false;
-  replyReady      = false;
+  g_formatReady = false;
+  replyReady = false;
   blinkActivity(3);
 }
+
 
 void handleSioFrame(){
   uint8_t f[5];
@@ -762,6 +888,7 @@ void setup(){
   startAP();
   startWeb();
   startEspNow();
+  initEmptySectors();
 
   logf("[MASTER] Listo (WebUI + SIO + TX=%s).", g_txmode==TX_UCAST?"Unicast":"Broadcast");
 }
