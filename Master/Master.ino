@@ -10,8 +10,8 @@
  *     • Diagnóstico SIO (medición/log y Autoajuste +10%)
  *     • Modo de envío ESPNOW: Broadcast / Unicast (persistente)
  *     • Reinicio remoto
- * - ESP-NOW compatible ESP-IDF v4.x / v5.x
- * - Defaults de timing orientados a corregir Error 138 en FORMAT
+ * - ESPNOW compatible ESP-IDF v4.x / v5.x
+ * - Defaults orientados a evitar Error 138 en FORMAT
  * Eduardo Quintana – 2025
  *******************************************************/
 #include <Arduino.h>
@@ -45,13 +45,13 @@ HardwareSerial SerialSIO(2);
 #define SECTOR_256   256
 #define MAX_SECTOR   720
 
-// Defaults seguros para arrancar FORMAT sin 138 (µs)
-#define DEF_T_ACK_TO_COMPLETE   1300
-#define DEF_T_COMPLETE_TO_DATA   950
-#define DEF_T_DATA_TO_CHK        120
-#define DEF_T_CHUNK             1300
+// Defaults “seguros” para FORMAT (µs)
+#define DEF_T_ACK_TO_COMPLETE 1950
+#define DEF_T_COMPLETE_TO_DATA 1570
+#define DEF_T_DATA_TO_CHK 260
+#define DEF_T_CHUNK 1600
 
-// Rango permitido (ajústalo si necesitas más)
+// Rango permitido
 #define SIO_MIN_US   50
 #define SIO_MAX_US 8000
 
@@ -61,7 +61,7 @@ static uint16_t T_COMPLETE_TO_DATA  = DEF_T_COMPLETE_TO_DATA;
 static uint16_t T_DATA_TO_CHK       = DEF_T_DATA_TO_CHK;
 static uint16_t T_CHUNK             = DEF_T_CHUNK;
 
-// ==================== ESP-NOW protocolo ====================
+// ==================== ESPNOW protocolo ====================
 #define TYPE_HELLO        0x20
 #define TYPE_CMD_FRAME    0x01
 #define TYPE_RESET        0x02
@@ -72,6 +72,11 @@ static uint16_t T_CHUNK             = DEF_T_CHUNK;
 #define TYPE_FORMAT_BAD   0x22
 #define CHUNK_PAYLOAD     240
 #define MAX_SECTOR_BYTES  256
+
+// Flags específicos para FORMAT
+volatile bool g_waitingFormat = false;   // esperando mapa desde esclavo
+volatile bool g_formatReady   = false;   // mapa recibido
+volatile int  g_formatLen     = 0;       // bytes válidos (128)
 
 // ==================== Estado de esclavos ====================
 struct SlaveInfo {
@@ -99,14 +104,9 @@ void logf(const char* fmt,...){
 uint8_t checksum(const uint8_t* d,int len){ uint16_t s=0; for(int i=0;i<len;i++){ s+=d[i]; if(s>0xFF) s=(s&0xFF)+1; } return s&0xFF; }
 static inline uint16_t clampu16(uint16_t v, uint16_t lo, uint16_t hi){ return v<lo?lo:(v>hi?hi:v); }
 
-void setSlavePresent(uint8_t dev, const uint8_t* mac, bool supp256){
-  int idx=devIndex(dev); if(idx<0) return;
-  slaves[idx].present=true; slaves[idx].supports256=supp256;
-  memcpy(slaves[idx].mac, mac, 6); slaves[idx].lastSeen=millis();
-}
-static void ensurePeer(const uint8_t* mac){
-  if(esp_now_is_peer_exist(mac)) return;
-  esp_now_peer_info_t p = {}; memcpy(p.peer_addr, mac, 6); p.channel=0; p.encrypt=false; esp_now_add_peer(&p);
+// ==================== LED actividad (opcional) ====================
+static inline void blinkActivity(uint8_t times=1){
+  for(uint8_t i=0;i<times;i++){ digitalWrite(LED_ACTIVITY,HIGH); delay(8); digitalWrite(LED_ACTIVITY,LOW); delay(8); }
 }
 
 // ==================== Persistencia de tiempos SIO ====================
@@ -150,31 +150,71 @@ void saveTxMode(uint8_t m){
   prefs.putUChar("txmode", (m?TX_UCAST:TX_BCAST));
   prefs.end();
 }
-
-// ==================== ESPNOW callbacks (IDF v4/v5) ====================
+// ==================== Registrar esclavo (HELLO) ====================
+void setSlavePresent(uint8_t dev, const uint8_t* mac, bool supportsDD){
+  int idx = devIndex(dev);
+  if(idx < 0) return;
+  slaves[idx].present = true;
+  slaves[idx].supports256 = supportsDD;
+  memcpy(slaves[idx].mac, mac, 6);
+  slaves[idx].lastSeen = millis();
+}
+// ==================== ESPNOW RX ====================
 #if ESP_IDF_VERSION_MAJOR >= 5
-void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status){ (void)info; (void)status; }
 void onDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incoming, int len){
   if(!recvInfo || !incoming || len<=0) return;
+  blinkActivity();
   const uint8_t *mac = recvInfo->src_addr;
 #else
-void onDataSent(const uint8_t* mac, esp_now_send_status_t status){ (void)mac; (void)status; }
 void onDataRecv(const uint8_t * mac, const uint8_t *incoming, int len){
   if(len<=0) return;
+  blinkActivity();
 #endif
+
   uint8_t type = incoming[0];
 
-  if(type==TYPE_HELLO && len>=3){
-    uint8_t dev=incoming[1]; bool s256=incoming[2];
-    setSlavePresent(dev, mac, s256);
-    if(TRACE) logf("[HELLO] %s DD=%u %02X:%02X:%02X:%02X:%02X:%02X",
-                   devName(dev), s256, mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    ensurePeer(mac);
+  // --- HELLO ---
+  if (type == TYPE_HELLO && len >= 3) {
+    if (!g_waitingFormat) { // evita alterar estado mientras formateas
+      uint8_t dev=incoming[1]; bool s256=incoming[2];
+      setSlavePresent(dev, mac, s256);
+      if(TRACE) logf("[HELLO] %s DD=%u %02X:%02X:%02X:%02X:%02X:%02X",
+                     devName(dev), s256, mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+      ensurePeer(mac);
+    }
     return;
   }
 
-  if((type==TYPE_SECTOR_CHUNK || type==TYPE_FORMAT_BAD) && len>=6){
-    uint8_t dev=incoming[1]; uint16_t sec=(uint16_t)incoming[2]|((uint16_t)incoming[3]<<8);
+  // --- TYPE_FORMAT_BAD (manejo específico) ---
+  if (type == TYPE_FORMAT_BAD && len >= 6) {
+    // [22][dev][secL][secH][ci][cc] + payload(128)
+    int payload = len - 6; if (payload > 128) payload = 128;
+
+    if (g_waitingFormat) {
+      memset(replyBuf, 0xFF, sizeof(replyBuf));
+      if (payload > 0) {
+        memcpy(replyBuf, incoming + 6, payload);
+        g_formatLen = payload;
+      } else {
+        g_formatLen = 128;
+      }
+
+      // Señaliza "mapa de formato disponible"
+      expectedChunks = 1;
+      receivedChunks = 1;
+      replySec       = 0;
+      replyReady     = true;
+
+      g_formatReady  = true;
+
+      if (TRACE) logf("[FORMAT] BAD MAP recibido (%d bytes)", g_formatLen);
+    }
+    return;
+  }
+
+  // --- SECTOR CHUNK (lecturas normales) ---
+  if (type==TYPE_SECTOR_CHUNK && len>=6){
+    uint16_t sec=(uint16_t)incoming[2]|((uint16_t)incoming[3]<<8);
     uint8_t ci=incoming[4], cc=incoming[5]; int pl=len-6;
     if(ci==0){ memset(replyBuf,0,MAX_SECTOR_BYTES); expectedChunks=cc; receivedChunks=0; replyReady=false; replySec=sec; }
     int off=ci*CHUNK_PAYLOAD; int copy=pl; if(off+copy>MAX_SECTOR_BYTES) copy=MAX_SECTOR_BYTES-off;
@@ -183,13 +223,19 @@ void onDataRecv(const uint8_t * mac, const uint8_t *incoming, int len){
     return;
   }
 
+  // --- ACK / NAK ---
   if(type==TYPE_ACK || type==TYPE_NAK){
     if(TRACE) logf("[ESPNOW] %s", (type==TYPE_ACK?"ACK":"NAK"));
     return;
   }
 }
 
-// ==================== Envío maestro->esclavo ====================
+// ==================== ESPNOW TX helpers ====================
+static inline void ensurePeer(const uint8_t* mac){
+  if(!mac) return;
+  if(esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t p = {}; memcpy(p.peer_addr, mac, 6); p.channel=0; p.encrypt=false; esp_now_add_peer(&p);
+}
 static inline bool send_now_to(const uint8_t* mac, const uint8_t* data, int n){
   ensurePeer(mac);
   return (esp_now_send(mac, data, n)==ESP_OK);
@@ -262,7 +308,7 @@ bool lockUnlock(uint8_t dev, const char* name11, bool lock){
 // ==================== SIO helpers y diagnóstico ====================
 uint8_t sioChk(const uint8_t* f){ return checksum(f,4); }
 
-// variables de diagnóstico (valores medidos en la última transacción)
+// variables de diagnóstico (mediciones de la última transacción)
 static uint32_t last_us_ack_to_comp   = 0;
 static uint32_t last_us_comp_to_data  = 0;
 static uint32_t last_us_data_to_chk   = 0;
@@ -271,6 +317,7 @@ static uint32_t last_us_chunk_delay   = 0;
 void sendAtariData(const uint8_t* buf,int n){
   uint32_t t0 = micros();
   delayMicroseconds(T_ACK_TO_COMPLETE);
+
   SerialSIO.write(SIO_COMPLETE);
   uint32_t t1 = micros();
   delayMicroseconds(T_COMPLETE_TO_DATA);
@@ -297,6 +344,74 @@ void sendAtariData(const uint8_t* buf,int n){
   }
 }
 
+void handleFormat(uint8_t dev,bool dd){
+
+  delayMicroseconds(1500);
+  SerialSIO.write(SIO_ACK);
+  SerialSIO.flush();
+  replyReady = false;
+  expectedChunks = receivedChunks = 0; replySec = 0;
+  g_waitingFormat = true; g_formatReady = false; g_formatLen = 0;
+
+  if (!sendCmd(dev, 0x21, 0, dd ? 1 : 0)) {
+    SerialSIO.write(SIO_ERROR);
+    g_waitingFormat = false;
+    return;
+  }
+
+  // === ESPERA CON KEEP-ALIVE (BUSY=0x42) ===
+  const unsigned long MAX_WAIT   = 90000UL;  // 90s
+  const unsigned long BUSY_PERIOD = 50UL;    // cada 50 ms
+  unsigned long t0 = millis(), tBusy = t0;
+
+  while (millis() - t0 < MAX_WAIT) {
+    if (millis() - tBusy >= BUSY_PERIOD) {
+      SerialSIO.write(0x42);  // BUSY
+      tBusy = millis();
+    }
+    if (g_formatReady && replyReady) break;
+    delay(2);
+  }
+
+  if (!(g_formatReady && replyReady) || g_formatLen != 128) {
+    SerialSIO.write(SIO_ERROR);
+    g_waitingFormat = false;
+    return;
+  }
+
+  // === ENVÍO FINAL: COMPLETE + BAD MAP + CHK ===
+  delayMicroseconds(T_ACK_TO_COMPLETE);
+  SerialSIO.write(SIO_COMPLETE);
+  SerialSIO.flush();
+
+  delayMicroseconds(T_COMPLETE_TO_DATA);
+
+  // La XF551 envía BAD MAP sin pausas largas, ~8 µs entre bytes
+  for (int i = 0; i < 128; i++) {
+    SerialSIO.write(replyBuf[i]);
+    delayMicroseconds(8);
+  }
+
+  uint8_t fchk = checksum(replyBuf, 128);
+  delayMicroseconds(T_DATA_TO_CHK + 250);
+  SerialSIO.write(fchk);
+  SerialSIO.flush();
+
+  delayMicroseconds(T_CHUNK + 300);
+
+  // Log de diagnóstico
+  Serial.println("[FORMAT] BAD MAP (128 bytes):");
+  for (int i = 0; i < 128; i++) {
+    Serial.printf("%02X%s", replyBuf[i], ((i & 0x0F) == 0x0F) ? "\n" : " ");
+  }
+  Serial.printf("[FORMAT] BAD MAP CHK calc=%02X\n", fchk);
+
+  g_waitingFormat = false;
+  g_formatReady   = false;
+  replyReady      = false;
+  blinkActivity(3);
+}
+
 void handleSioFrame(){
   uint8_t f[5];
   for(int i=0;i<5;i++){
@@ -311,7 +426,7 @@ void handleSioFrame(){
   if(f[4]!=chk){
     delayMicroseconds(1000);
     SerialSIO.write(SIO_NAK);
-    if(TRACE) logf("[SIO] ❌ Checksum invalido al inicio (posible 138). Recv=%02X Calc=%02X", f[4], chk);
+    if(TRACE) logf("[SIO] ❌ Checksum inválido al inicio (posible 138). Recv=%02X Calc=%02X", f[4], chk);
     return;
   }
   if(dev<0x31||dev>0x34){
@@ -354,56 +469,8 @@ void handleSioFrame(){
     return;
   }
 
-  if(base==0x21){ // FORMAT
-    // Mantener /COMMAND bajo durante toda la operación
-    pinMode(SIO_COMMAND, OUTPUT);
-    digitalWrite(SIO_COMMAND, LOW);
-
-    SerialSIO.write(SIO_ACK);
-    delayMicroseconds(1600); // ACK→COMPLETE (ajuste fino anti-138)
-
-    // Espera mínima antes de enviar COMPLETE
-    SerialSIO.write(SIO_COMPLETE);
-    delayMicroseconds(950); // COMPLETE→DATA
-
-    replyReady = false; expectedChunks = receivedChunks = 0; replySec = 0;
-
-    // Enviar FORMAT al esclavo
-    if(!sendCmd(dev, 0x21, 0, dd ? 1 : 0)){
-      SerialSIO.write(SIO_ERROR);
-      digitalWrite(SIO_COMMAND, HIGH);
-      pinMode(SIO_COMMAND, INPUT_PULLUP);
-      return;
-    }
-
-    // Esperar hasta 90s la respuesta TYPE_FORMAT_BAD
-    unsigned long t0 = millis(); bool ok = false;
-    uint8_t bad[128]; memset(bad, 0xFF, sizeof(bad));
-    while(millis() - t0 < 90000){
-      if(replyReady){
-        memcpy(bad, replyBuf, 128);
-        ok = true;
-        break;
-      }
-      delay(5);
-    }
-
-    // Si no llegó o falló, enviar ERROR
-    if(!ok){
-      SerialSIO.write(SIO_ERROR);
-      digitalWrite(SIO_COMMAND, HIGH);
-      pinMode(SIO_COMMAND, INPUT_PULLUP);
-      return;
-    }
-
-    // Enviar datos de sectores malos ($FF $FF si ninguno)
-    delayMicroseconds(1200);
-    sendAtariData(bad, 128);
-
-    // Liberar /COMMAND con retardo seguro
-    delayMicroseconds(300);
-    digitalWrite(SIO_COMMAND, HIGH);
-    pinMode(SIO_COMMAND, INPUT_PULLUP);
+  if (base == 0x21) { // FORMAT
+    handleFormat(dev,dd);
     return;
   }
 
@@ -414,86 +481,121 @@ void handleSioFrame(){
 // ==================== WebUI ====================
 String htmlHeader(){
   return F("<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-           "<title>XF551 Bridge</title><style>"
-           "body{font-family:system-ui,Arial;margin:20px}"
-           "code{background:#eee;padding:2px 6px;border-radius:4px}"
-           "button,input,select{padding:6px 10px;margin:4px}"
-           "table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 8px}"
-           ".box{border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0}"
-           ".row{display:flex;gap:8px;flex-wrap:wrap}"
-           ".col{display:flex;flex-direction:column;min-width:200px}"
-           ".warn{color:#b00}"
+           "<title>ATARI Bridge XF551's</title><style>"
+           "*{box-sizing:border-box}"
+           "body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:#f5f5f5;color:#333;line-height:1.6}"
+           "code{background:#e9ecef;padding:2px 6px;border-radius:4px;font-family:'Courier New',monospace}"
+           "button,input,select{padding:10px 12px;margin:4px 0;border:1px solid #ddd;border-radius:6px;font-size:14px}"
+           "button{background:#007bff;color:white;border:none;cursor:pointer;font-weight:500;transition:background 0.2s}"
+           "button:hover{background:#0056b3}"
+           "button[style*='background:#d33']{background:#dc3545}"
+           "button[style*='background:#d33']:hover{background:#c82333}"
+           "input,select{background:white;border:1px solid #ced4da;width:100%}"
+           "input:focus,select:focus{outline:none;border-color:#007bff;box-shadow:0 0 0 2px rgba(0,123,255,0.25)}"
+           "table{width:100%;border-collapse:collapse;background:white;box-shadow:0 1px 3px rgba(0,0,0,0.1)}"
+           "td,th{border:1px solid #dee2e6;padding:10px;text-align:left}"
+           "th{background:#f8f9fa;font-weight:600}"
+           ".box{background:white;border-radius:10px;padding:20px;margin:16px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);border:1px solid #e9ecef}"
+           ".row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}"
+           ".col{display:flex;flex-direction:column;flex:1;min-width:250px}"
+           ".warn{color:#dc3545;background:#f8d7da;padding:8px 12px;border-radius:4px;border:1px solid #f5c6cb}"
+           ".success{color:#155724;background:#d4edda;padding:8px 12px;border-radius:4px;border:1px solid #c3e6cb}"
+           ".info{color:#0c5460;background:#d1ecf1;padding:8px 12px;border-radius:4px;border:1px solid #bee5eb}"
+           "h1,h2,h3{margin:0 0 16px 0;color:#2c3e50}"
+           "h1{font-size:28px;font-weight:700}"
+           "h2{font-size:22px;font-weight:600;padding-bottom:8px;border-bottom:2px solid #e9ecef}"
+           "h3{font-size:18px;font-weight:500;color:#6c757d}"
+           "label{font-weight:500;margin-bottom:4px;display:block}"
+           "small{color:#6c757d;font-size:12px}"
+           "ul{margin:8px 0;padding-left:20px}"
+           "li{margin:4px 0}"
+           ".form-group{margin-bottom:16px}"
+           ".btn-group{display:flex;gap:8px;flex-wrap:wrap}"
+           ".btn-group button{flex:1;min-width:120px}"
+           ".table-responsive{overflow-x:auto}"
+           "@media (max-width:768px){body{padding:12px}.box{padding:16px;margin:12px 0}h1{font-size:24px}h2{font-size:20px}.row{gap:8px}.col{min-width:100%}button,input,select{padding:12px}}"
+           "@media (max-width:480px){table{font-size:14px}td,th{padding:8px 6px}.btn-group button{min-width:100%}}"
            "</style></head><body>");
 }
 String htmlFooter(){ return F("</body></html>"); }
 
 String txModeBox(){
   String s;
-  s += "<div class='box'><h2>Modo de Envío ESPNOW</h2>";
+  s += "<div class='box'><h2>📡 Modo de Envío ESPNOW</h2>";
   s += "<form method='post' action='/txmode_save'>";
-  s += "<label>Modo:</label> ";
-  s += "<select name='mode'>";
-  s += String("<option value='0' ") + (g_txmode==TX_BCAST?"selected":"") + ">Broadcast</option>";
-  s += String("<option value='1' ") + (g_txmode==TX_UCAST?"selected":"") + ">Unicast</option>";
-  s += "</select> ";
-  s += "<button>Guardar</button>";
-  s += "</form>";
-  s += "<p><small>Unicast reduce tráfico al aire y colisiones cuando hay varios esclavos. Broadcast es útil para pruebas o cuando el maestro aún no conoce la MAC del esclavo.</small></p>";
+  s += "<div class='form-group'>";
+  s += "<label for='mode'>Modo de transmisión:</label>";
+  s += "<select name='mode' id='mode'>";
+  s += String("<option value='0' ") + (g_txmode==TX_BCAST?"selected":"") + ">📢 Broadcast</option>";
+  s += String("<option value='1' ") + (g_txmode==TX_UCAST?"selected":"") + ">🔒 Unicast</option>";
+  s += "</select>";
   s += "</div>";
+  s += "<button type='submit'>💾 Guardar Configuración</button>";
+  s += "<div class='info' style='margin-top:12px'>";
+  s += "<strong>💡 Info:</strong> Unicast reduce colisiones cuando hay varios esclavos. Broadcast es útil al inicio.";
+  s += "</div>";
+  s += "</form></div>";
   return s;
 }
 
 String sioTimingForm(){
   String s;
-  s += "<div class='box'><h2>Temporización SIO (µs)</h2>";
+  s += "<div class='box'><h2>⏱️ Temporización SIO (µs)</h2>";
   s += "<form method='post' action='/sio_save'>";
-  s += "<div class='row'>";
-  s += "<div class='col'><label>ACK → COMPLETE</label><input name='ackc' type='number' min='50' max='5000' value='"+String(T_ACK_TO_COMPLETE)+"'></div>";
-  s += "<div class='col'><label>COMPLETE → DATA</label><input name='ctd' type='number' min='50' max='5000' value='"+String(T_COMPLETE_TO_DATA)+"'></div>";
-  s += "<div class='col'><label>DATA → CHK</label><input name='dtc' type='number' min='50' max='5000' value='"+String(T_DATA_TO_CHK)+"'></div>";
-  s += "<div class='col'><label>CHUNK DELAY</label><input name='chunk' type='number' min='50' max='5000' value='"+String(T_CHUNK)+"'></div>";
-  s += "</div>";
-  s += "<p><small>Se guardan en NVS y se <b>aplican tras reiniciar</b>. Valores altos ayudan a evitar el Error 138 al inicio de FORMAT.</small></p>";
-  s += "<button type='submit'>Guardar</button>";
-  s += "</form> ";
-  s += "<form method='post' action='/sio_reset' style='display:inline'><button>Restaurar por defecto</button></form> ";
-  s += "<form method='post' action='/reboot' style='display:inline'><button style='background:#d33;color:#fff'>🔄 Reiniciar ahora</button></form>";
-  s += "</div>";
+  s += "<div class='table-responsive'>";
+  s += "<table><tr><th>Parámetro</th><th>Configurado</th><th>Medido (última transacción)</th></tr>";
+  s += "<tr><td>ACK → COMPLETE</td><td><input name='ackc' type='number' min='50' max='5000' value='"+String(T_ACK_TO_COMPLETE)+"'></td><td><code>"+String(last_us_ack_to_comp)+" µs</code></td></tr>";
+  s += "<tr><td>COMPLETE → DATA</td><td><input name='ctd' type='number' min='50' max='5000' value='"+String(T_COMPLETE_TO_DATA)+"'></td><td><code>"+String(last_us_comp_to_data)+" µs</code></td></tr>";
+  s += "<tr><td>DATA → CHK</td><td><input name='dtc' type='number' min='50' max='5000' value='"+String(T_DATA_TO_CHK)+"'></td><td><code>"+String(last_us_data_to_chk)+" µs</code></td></tr>";
+  s += "<tr><td>CHUNK DELAY</td><td><input name='chunk' type='number' min='50' max='5000' value='"+String(T_CHUNK)+"'></td><td><code>"+String(last_us_chunk_delay)+" µs</code></td></tr>";
+  s += "</table></div>";
+  s += "<div class='info' style='margin:12px 0'><strong>📝 Nota:</strong> Se guardan en NVS y aplican tras reiniciar.</div>";
+  s += "<div class='btn-group'>";
+  s += "<button type='submit'>💾 Guardar</button>";
+  s += "<form method='post' action='/sio_autoplus' style='display:inline;flex:1'><button type='submit'>📈 Autoajustar +10%</button></form>";
+  s += "<form method='post' action='/sio_applymeasured' style='display:inline;flex:1'><button type='submit'>🔧 Usar Valores Medidos</button></form>";
+  s += "<form method='post' action='/sio_reset' style='display:inline;flex:1'><button type='submit'>🔄 Restaurar</button></form>";
+  s += "<form method='post' action='/reboot' style='display:inline;flex:1'><button type='submit' style='background:#d33'>🔄 Reiniciar</button></form>";
+  s += "</div></form></div>";
   return s;
 }
+
 String sioDiagBox(){
   String s;
-  s += "<div class='box'><h2>Diagnóstico SIO</h2>";
-  s += "<p>Últimas mediciones aproximadas (incluyen latencia de escritura UART):</p>";
+  s += "<div class='box'><h2>🔍 Diagnóstico SIO</h2>";
   s += "<ul>";
-  s += "<li>ACK → COMPLETE: <b>"+String(last_us_ack_to_comp)+"</b> µs</li>";
-  s += "<li>COMPLETE → DATA: <b>"+String(last_us_comp_to_data)+"</b> µs</li>";
-  s += "<li>DATA → CHK: <b>"+String(last_us_data_to_chk)+"</b> µs</li>";
-  s += "<li>CHUNK DELAY: <b>"+String(last_us_chunk_delay)+"</b> µs</li>";
+  s += "<li>ACK → COMPLETE: <code><b>"+String(last_us_ack_to_comp)+"</b> µs</code></li>";
+  s += "<li>COMPLETE → DATA: <code><b>"+String(last_us_comp_to_data)+"</b> µs</code></li>";
+  s += "<li>DATA → CHK: <code><b>"+String(last_us_data_to_chk)+"</b> µs</code></li>";
+  s += "<li>CHUNK DELAY: <code><b>"+String(last_us_chunk_delay)+"</b> µs</code></li>";
   s += "</ul>";
-  s += "<form method='post' action='/diag_measure' style='display:inline'><button>Medir tiempos (log a Serial)</button></form> ";
-  s += "<form method='post' action='/sio_autoplus' style='display:inline'><button>Autoajustar +10% (guardar)</button></form>";
-  s += "<p class='warn'><small>“Medir tiempos” escribe las mediciones por Serial en la <i>próxima</i> respuesta SIO que ocurra (p.ej. al iniciar FORMAT).</small></p>";
+  s += "<div class='btn-group'>";
+  s += "<form method='post' action='/diag_measure' style='display:inline;flex:1'><button type='submit'>📊 Medir Tiempos</button></form>";
+  s += "<form method='post' action='/sio_autoplus' style='display:inline;flex:1'><button type='submit'>📈 Autoajustar +10%</button></form>";
+  s += "</div>";
+  s += "<div class='warn' style='margin-top:12px'><strong>⚠️ Nota:</strong> Las mediciones se actualizan en la próxima operación SIO.</div>";
   s += "</div>";
   return s;
 }
 
 void handleRoot(){
   String s = htmlHeader();
-  s += F("<h1>XF551 Bridge (ESP-NOW)</h1>");
+  s += F("<h1>🎮 ATARI Bridge XF551</h1><h3>Configuración ESP-NOW</h3>");
 
   // Unidades
-  s += F("<div class='box'><h2>Unidades</h2><table><tr><th>ID</th><th>Presente</th><th>MAC</th><th>DD</th><th>Acciones</th></tr>");
+  s += F("<div class='box'><h2>💽 Unidades</h2><div class='table-responsive'><table><tr><th>ID</th><th>Est</th><th>MAC</th><th>DD</th><th>Acciones</th></tr>");
   for(int i=0;i<4;i++){
     char macbuf[24]; if(slaves[i].present) sprintf(macbuf,"%02X:%02X:%02X:%02X:%02X:%02X",slaves[i].mac[0],slaves[i].mac[1],slaves[i].mac[2],slaves[i].mac[3],slaves[i].mac[4],slaves[i].mac[5]); else strcpy(macbuf,"—");
-    s += "<tr><td>D"+String(i+1)+"</td><td>"+String(slaves[i].present?"Sí":"No")+"</td><td>"+String(macbuf)+"</td><td>"+String(slaves[i].supports256?"Sí":"No")+"</td><td>";
-    s += "<form method='post' action='/reset' style='display:inline'><input type='hidden' name='d' value='"+String(i+1)+"'><button>Reset</button></form>";
+    String status = slaves[i].present ? "🟢" : "🔴";
+    String ddStatus = slaves[i].supports256 ? "✅ Sí" : "❌ No";
+    s += "<tr><td><strong>D"+String(i+1)+"</strong></td><td>"+status+"</td><td style='font-family:monospace;font-size:12px;'>"+String(macbuf)+"</td><td>"+ddStatus+"</td><td>";
+    s += "<form method='post' action='/reset' style='display:inline'><input type='hidden' name='d' value='"+String(i+1)+"'><button type='submit' style='padding:6px 10px;background:#6c757d'>🔄 Reset</button></form>";
     s += "</td></tr>";
   }
-  s += "</table></div>";
+  s += "</table></div></div>";
 
-  // Lock/Unlock
-  s += F("<div class='box'><h2>LOCK / UNLOCK</h2>"
+  // Lock/Unlock (oculto)
+  s += F("<div class='box' style='display:none;'><h2>🔒 LOCK / UNLOCK</h2>"
        "<p>Nombre exacto (11 chars 8+3, sin punto, mayúsculas, con espacios):</p>"
        "<form method='post' action='/lock'><label>Unidad:</label>"
        "<select name='d'><option>1</option><option>2</option><option>3</option><option>4</option></select> "
@@ -505,12 +607,12 @@ void handleRoot(){
        "<button>UNLOCK</button></form></div>");
 
   // Wi-Fi AP
-  s += "<div class='box'><h2>Wi-Fi (AP)</h2>"
-       "<form method='post' action='/wifi'><label>SSID:</label>"
-       "<input name='ssid' value='"+AP_SSID+"'> "
-       "<label>Clave:</label><input name='psk' value='"+AP_PSK+"' type='password'> "
-       "<button>Cambiar</button></form>"
-       "<p><small>Reinicia para aplicar.</small></p></div>";
+  s += "<div class='box'><h2>📶 Wi-Fi (Punto de Acceso)</h2>";
+  s += "<form method='post' action='/wifi'>";
+  s += "<div class='form-group'><label for='ssid'>Nombre SSID:</label><input name='ssid' id='ssid' value='"+AP_SSID+"' placeholder='Ingresa SSID'></div>";
+  s += "<div class='form-group'><label for='psk'>Contraseña:</label><input name='psk' id='psk' value='"+AP_PSK+"' type='password' placeholder='Ingresa contraseña'></div>";
+  s += "<button type='submit'>💾 Cambiar Configuración</button>";
+  s += "</form><div class='info' style='margin-top:12px'><strong>ℹ️</strong> Reinicia para aplicar cambios Wi-Fi.</div></div>";
 
   // Modo de envío
   s += txModeBox();
@@ -530,12 +632,13 @@ void handleReset(){ sendResetBroadcast(); web.sendHeader("Location","/"); web.se
 
 void handleLockUnlock(bool isLock){
   if(!web.hasArg("d")||!web.hasArg("n")){ web.send(400,"text/plain","Parámetros requeridos"); return; }
-  int dn=web.arg("d").toInt(); if(dn<1||dn>4){ web.send(400,"text/plain","Unidad invalida"); return; }
+  int dn=web.arg("d").toInt(); if(dn<1||dn>4){ web.send(400,"text/plain","Unidad inválida"); return; }
   String nm=web.arg("n"); if(nm.length()!=11){ web.send(400,"text/plain","Nombre debe tener 11 chars (8+3)"); return; }
   nm.toUpperCase(); char name11[12]; memset(name11,' ',11); name11[11]=0; for(int i=0;i<11;i++) name11[i]=nm.charAt(i);
   bool ok=lockUnlock((uint8_t)(0x30+dn),name11,isLock);
   web.send(200,"text/plain",String(isLock?"LOCK ":"UNLOCK ")+(ok?"OK":"FAIL"));
 }
+
 void handleWifi(){
   String ssid=web.arg("ssid"), psk=web.arg("psk");
   if(ssid.length()<3){ web.send(400,"text/plain","SSID muy corto"); return; }
@@ -543,6 +646,7 @@ void handleWifi(){
   prefs.begin("apcfg",false); prefs.putString("ssid",ssid); prefs.putString("psk",psk); prefs.end();
   web.send(200,"text/plain","Guardado. Reinicia el Maestro para aplicar.");
 }
+
 void handleSioSave(){
   if(!web.hasArg("ackc")||!web.hasArg("ctd")||!web.hasArg("dtc")||!web.hasArg("chunk")){
     web.send(400,"text/plain","Parámetros requeridos"); return;
@@ -554,8 +658,30 @@ void handleSioSave(){
   saveSioTiming(a,c,d,h);
   web.send(200,"text/plain","Temporización guardada. Reinicia para aplicar.");
 }
-void handleSioReset(){ saveSioTiming(DEF_T_ACK_TO_COMPLETE,DEF_T_COMPLETE_TO_DATA,DEF_T_DATA_TO_CHK,DEF_T_CHUNK);
-  web.send(200,"text/plain","Temporización restaurada. Reinicia para aplicar."); }
+
+void handleSioReset(){
+  saveSioTiming(DEF_T_ACK_TO_COMPLETE,DEF_T_COMPLETE_TO_DATA,DEF_T_DATA_TO_CHK,DEF_T_CHUNK);
+  web.send(200,"text/plain","Temporización restaurada. Reinicia para aplicar.");
+}
+
+void handleSioAutoPlus(){
+  uint32_t a = (uint32_t)(T_ACK_TO_COMPLETE  * 1.10f);
+  uint32_t c = (uint32_t)(T_COMPLETE_TO_DATA * 1.10f);
+  uint32_t d = (uint32_t)(T_DATA_TO_CHK      * 1.10f);
+  uint32_t h = (uint32_t)(T_CHUNK            * 1.10f);
+  saveSioTiming(clampu16(a,SIO_MIN_US,SIO_MAX_US),
+                clampu16(c,SIO_MIN_US,SIO_MAX_US),
+                clampu16(d,SIO_MIN_US,SIO_MAX_US),
+                clampu16(h,SIO_MIN_US,SIO_MAX_US));
+  web.send(200,"text/plain","+10% guardado. Reinicia para aplicar.");
+}
+
+void handleSioApplyMeasured(){
+  // Guarda los valores activos (medidos/ajustados) como configurados
+  saveSioTiming(T_ACK_TO_COMPLETE, T_COMPLETE_TO_DATA, T_DATA_TO_CHK, T_CHUNK);
+  web.send(200,"text/plain","Valores medidos guardados. Reinicia para aplicar.");
+}
+
 void handleReboot(){ web.send(200,"text/plain","Reiniciando..."); delay(500); ESP.restart(); }
 void handleDiagMeasure(){ web.send(200,"text/plain","Listo. Inicia un comando SIO y revisa el Serial."); }
 
@@ -576,6 +702,7 @@ void startAP(){
   WiFi.softAP(AP_SSID.c_str(), AP_PSK.c_str());
   if(TRACE) logf("[AP] SSID=%s IP=%s", AP_SSID.c_str(), WiFi.softAPIP().toString().c_str());
 }
+
 void startWeb(){
   web.on("/",HTTP_GET,handleRoot);
   web.on("/reset",HTTP_POST,handleReset);
@@ -586,21 +713,30 @@ void startWeb(){
   web.on("/sio_reset",HTTP_POST,handleSioReset);
   web.on("/reboot",HTTP_POST,handleReboot);
   web.on("/diag_measure",HTTP_POST,handleDiagMeasure);
-  web.on("/sio_autoplus",HTTP_POST,[](){
-    uint32_t a = (uint32_t)(T_ACK_TO_COMPLETE  * 1.10f);
-    uint32_t c = (uint32_t)(T_COMPLETE_TO_DATA * 1.10f);
-    uint32_t d = (uint32_t)(T_DATA_TO_CHK      * 1.10f);
-    uint32_t h = (uint32_t)(T_CHUNK            * 1.10f);
-    saveSioTiming(clampu16(a,SIO_MIN_US,SIO_MAX_US),
-                  clampu16(c,SIO_MIN_US,SIO_MAX_US),
-                  clampu16(d,SIO_MIN_US,SIO_MAX_US),
-                  clampu16(h,SIO_MIN_US,SIO_MAX_US));
-    web.send(200,"text/plain","+10% guardado. Reinicia para aplicar.");
-  });
+  web.on("/sio_autoplus",HTTP_POST,handleSioAutoPlus);
+  web.on("/sio_applymeasured",HTTP_POST,handleSioApplyMeasured);
   web.on("/txmode_save",HTTP_POST,handleTxModeSave);
   web.begin();
   if(TRACE) logf("[WEB] UI lista en http://%s", WiFi.softAPIP().toString().c_str());
 }
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  (void)info;
+  if (status == ESP_NOW_SEND_SUCCESS)
+    Serial.println("[ESPNOW] Envío OK");
+  else
+    Serial.println("[ESPNOW] Falla en envío");
+}
+#else
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS)
+    Serial.println("[ESPNOW] Envío OK");
+  else
+    Serial.println("[ESPNOW] Falla en envío");
+}
+#endif
+
 void startEspNow(){
   if(esp_now_init()!=ESP_OK){ logf("[ERR] esp_now_init"); ESP.restart(); }
   esp_now_register_send_cb(onDataSent);
@@ -614,13 +750,19 @@ void setup(){
   pinMode(LED_STATUS,OUTPUT); pinMode(LED_ACTIVITY,OUTPUT);
   digitalWrite(LED_STATUS, HIGH);
   // UART SIO 19200 8N1
-  SerialSIO.begin(19200, SERIAL_8N1, SIO_DATA_IN, SIO_DATA_OUT);
+  SerialSIO.begin(19200, SERIAL_8N1, SIO_DATA_IN, SIO_DATA_OUT, false);
+
   for(int i=0;i<4;i++){ slaves[i].present=false; slaves[i].supports256=false; }
+
   // Timings / TX mode desde NVS
   loadSioTiming();
   loadTxMode();
+
   // Inicios
-  startAP(); startWeb(); startEspNow();
+  startAP();
+  startWeb();
+  startEspNow();
+
   logf("[MASTER] Listo (WebUI + SIO + TX=%s).", g_txmode==TX_UCAST?"Unicast":"Broadcast");
 }
 
@@ -639,4 +781,4 @@ void loop(){
     while(SerialSIO.available()) SerialSIO.read();
   }
   delay(1);
-} 
+}
