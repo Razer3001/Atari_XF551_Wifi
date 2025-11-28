@@ -338,7 +338,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
  </div>
 
  <div class="footer">
- ESP32 Master · XF551 WiFi · V1
+ ESP32 Master · XF551 WiFi · V1.1
  </div>
  </div>
  </div>
@@ -511,11 +511,12 @@ uint8_t sioChecksum(const uint8_t* d, int len){
  return s & 0xFF;
 }
 
+// *** logf CORREGIDO ***
 void logf(const char* fmt, ...){
  char buf[256];
  va_list ap;
  va_start(ap, fmt);
- vsnprintf(buf, sizeof(buf), fmt, ap);
+ vsnprintf(buf, sizeof(buf), fmt, ap); // <- aquí va 'fmt'
  va_end(ap);
  Serial.println(buf);
 }
@@ -641,8 +642,10 @@ void handleRoot(){
  server.send_P(200, "text/html", INDEX_HTML);
 }
 
-// JSON con estado (drives + timings)
+// JSON con estado (drives + timings) — con logs extra
 void handleApiStatus(){
+ Serial.println("[WEB] /api/status llamado");
+
  String json;
  json.reserve(1024);
  json += F("{\"drives\":[");
@@ -696,6 +699,9 @@ void handleApiStatus(){
  json += F("\"dataToChk\":"); json += String(T_DATA_TO_CHK); json += F(",");
  json += F("\"chunkDelay\":"); json += String(T_CHUNK_DELAY);
  json += F("}}");
+
+ Serial.print("[WEB] /api/status JSON = ");
+ Serial.println(json);
 
  server.send(200, "application/json", json);
 }
@@ -1201,7 +1207,7 @@ void handleSioHeader(uint8_t f[5]){
  uint8_t cmd = f[1];
  uint8_t aux1 = f[2];
  uint8_t aux2 = f[3];
- uint8_t recvChk = f[4];
+ uint8_t recvChk= f[4];
 
  uint8_t calcChk = sioChecksum(f, 4);
 
@@ -1364,8 +1370,8 @@ void setup(){
 
  // WebServer rutas
  server.on("/", handleRoot);
- server.on("/api/status", HTTP_GET, handleApiStatus);
- server.on("/set_timing", HTTP_GET, handleSetTiming);
+ server.on("/api/status",HTTP_GET, handleApiStatus);
+ server.on("/set_timing",HTTP_GET, handleSetTiming);
  server.on("/set_prefetch", HTTP_GET, handleSetPrefetch);
  server.begin();
  Serial.println("[WEB] Servidor HTTP iniciado en puerto 80");
