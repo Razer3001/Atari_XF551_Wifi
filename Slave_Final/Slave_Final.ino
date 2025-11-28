@@ -1,21 +1,26 @@
 /*******************************************************
- * SLAVE – XF551 REAL – STATUS + READ + PREFETCH N
+ * SLAVE – XF551 REAL – STATUS + READ + FORMAT + WRITE + PREFETCH
  * - Conecta una XF551 real por SIO
  * - DEVICE_ID = 0x31..0x34 (D1..D4)
  * - Soporta:
- *    • STATUS (0x53)
- *    • READ SECTOR (0x52) con prefetch configurable
+ * • STATUS (0x53)
+ * • READ SECTOR (0x52) con prefetch (0..4 sectores)
+ * • FORMAT (0x21)
+ * • WRITE SECTOR (0x50 / 0x57)
  * - Protocolo ESP-NOW:
- *    • Recibe TYPE_CMD_FRAME:
- *        [0]=TYPE_CMD_FRAME
- *        [1]=cmd
- *        [2]=dev
- *        [3]=secL
- *        [4]=secH
- *        [5]=dens (!=0=DD)
- *        [6]=prefetchCount (opcional; si no viene, asumimos 1)
- *    • Devuelve TYPE_SECTOR_CHUNK (para STATUS y READ)
- *    • Envía HELLO al arrancar
+ * • Recibe TYPE_CMD_FRAME:
+ * [0]=TYPE_CMD_FRAME
+ * [1]=cmd
+ * [2]=dev
+ * [3]=secL / aux1
+ * [4]=secH / aux2
+ * [5]=dens (!=0=DD)
+ * [6]=prefetchCount (#sectores adelantados, opcional)
+ * • Para READ/STATUS/FORMAT devuelve TYPE_SECTOR_CHUNK al MASTER
+ * • Para WRITE:
+ * - Recibe TYPE_SECTOR_CHUNK con DATA desde el MASTER
+ * - Recibe luego TYPE_CMD_FRAME con cmd=0x50/0x57
+ * - Escribe en la XF551, envía TYPE_ACK/TYPE_NAK
  *******************************************************/
 
 #include <Arduino.h>
@@ -26,349 +31,439 @@
 #include <stdarg.h>
 
 // ======== SIO hacia XF551 (MASTER SIO) ========
-#define SIO_RX       16   // desde XF551
-#define SIO_TX       17   // hacia XF551
-#define SIO_COMMAND  18
+#define SIO_RX 16 // desde XF551
+#define SIO_TX 17 // hacia XF551
+#define SIO_COMMAND 18
 
 HardwareSerial SerialSIO(2);
 
 // Códigos SIO
-#define SIO_ACK      0x41
-#define SIO_NAK      0x4E
+#define SIO_ACK 0x41
+#define SIO_NAK 0x4E
 #define SIO_COMPLETE 0x43
-#define SIO_ERROR    0x45
+#define SIO_ERROR 0x45
 
 // ======== Protocolo ESP-NOW ========
-#define TYPE_HELLO        0x20
-#define TYPE_CMD_FRAME    0x01
+#define TYPE_HELLO 0x20
+#define TYPE_CMD_FRAME 0x01
 #define TYPE_SECTOR_CHUNK 0x10
-#define TYPE_ACK          0x11
-#define TYPE_NAK          0x12
+#define TYPE_ACK 0x11
+#define TYPE_NAK 0x12
 
-#define CHUNK_PAYLOAD     240
-#define MAX_SECTOR_BYTES  256
-#define SECTOR_128        128
-#define SECTOR_256        256
+#define CHUNK_PAYLOAD 240
+#define MAX_SECTOR_BYTES 256
+#define SECTOR_128 128
+#define SECTOR_256 256
 
-// Prefetch máximo que soporta este SLAVE
 #define MAX_PREFETCH_SECTORS 4
 
 // Configura este valor según la unidad que quieras emular:
-const uint8_t DEVICE_ID   = 0x31;   // 0x31=D1, 0x32=D2, 0x33=D3, 0x34=D4
-const bool    supports256 = true;   // la XF551 real soporta DD
+const uint8_t DEVICE_ID = 0x31; // 0x31=D1, 0x32=D2, 0x33=D3, 0x34=D4
+const bool supports256 = true; // la XF551 real soporta DD
 
-const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF};
 
 // Último master conocido (para responder unicast si llega unicast)
 uint8_t g_lastMaster[6] = {0};
-bool    g_haveMasterMac = false;
+bool g_haveMasterMac = false;
 
-// ======== CACHE multi-sector para PREFETCH ========
-struct CacheEntry {
-  bool     valid;
-  uint8_t  dev;
-  bool     dd;
-  uint16_t sec;
-  int      len;
-  uint8_t  data[MAX_SECTOR_BYTES];
-};
+// ======== PREFETCH CACHE (multi-sector) ========
+static uint8_t cacheBuf[MAX_PREFETCH_SECTORS][MAX_SECTOR_BYTES];
+static uint16_t cacheFirstSec = 0;
+static uint8_t cacheCount = 0; // 0 = sin cache
+static uint8_t cacheDev = 0;
+static bool cacheDD = false;
 
-CacheEntry cache[MAX_PREFETCH_SECTORS];
-uint8_t    cacheNext = 0;
+// ======== BUFFER PARA WRITE DESDE MASTER ========
+static uint8_t writeBuf[MAX_SECTOR_BYTES];
+static uint16_t writeSec = 0;
+static int writeLen = 0;
+static bool writeBufReady = false;
 
 // ======== Utilidades ========
 
 void logf(const char* fmt, ...){
-  char b[256];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(b, sizeof(b), fmt, ap);  // usar fmt aquí
-  va_end(ap);
-  Serial.println(b);
+ char b[256];
+ va_list ap;
+ va_start(ap, fmt);
+ vsnprintf(b, sizeof(b), fmt, ap);
+ va_end(ap);
+ Serial.println(b);
 }
 
-
 uint8_t sioChecksum(const uint8_t* d, int len){
-  uint16_t s = 0;
-  for (int i = 0; i < len; i++){
-    s += d[i];
-    if (s > 0xFF) s = (s & 0xFF) + 1;
-  }
-  return s & 0xFF;
+ uint16_t s = 0;
+ for (int i = 0; i < len; i++){
+ s += d[i];
+ if (s > 0xFF) s = (s & 0xFF) + 1;
+ }
+ return s & 0xFF;
 }
 
 void ensurePeer(const uint8_t* mac){
-  if (!mac) return;
-  if (esp_now_is_peer_exist(mac)) return;
-  esp_now_peer_info_t p = {};
-  memcpy(p.peer_addr, mac, 6);
-  p.channel = 0;
-  p.encrypt = false;
-  esp_err_t e = esp_now_add_peer(&p);
-  if (e != ESP_OK){
-    logf("[ESPNOW] esp_now_add_peer error=%d", (int)e);
-  }
+ if (!mac) return;
+ if (esp_now_is_peer_exist(mac)) return;
+ esp_now_peer_info_t p = {};
+ memcpy(p.peer_addr, mac, 6);
+ p.channel = 0;
+ p.encrypt = false;
+ esp_now_add_peer(&p);
 }
 
 const uint8_t* replyMac(){
-  return g_haveMasterMac ? g_lastMaster : BCAST_MAC;
+ return g_haveMasterMac ? g_lastMaster : BCAST_MAC;
 }
 
 bool send_now_to(const uint8_t* mac, const uint8_t* data, int len){
-  ensurePeer(mac);
-  esp_err_t e = esp_now_send(mac, data, len);
-  if (e != ESP_OK){
-    logf("[ESPNOW] esp_now_send error=%d", (int)e);
-  }
-  return (e == ESP_OK);
+ ensurePeer(mac);
+ return (esp_now_send(mac, data, len) == ESP_OK);
 }
 
 void sendHello(){
-  uint8_t p[3];
-  p[0] = TYPE_HELLO;
-  p[1] = DEVICE_ID;
-  p[2] = supports256 ? 1 : 0;
-  send_now_to(BCAST_MAC, p, sizeof(p));
+ uint8_t p[3];
+ p[0] = TYPE_HELLO;
+ p[1] = DEVICE_ID;
+ p[2] = supports256 ? 1 : 0;
+ send_now_to(BCAST_MAC, p, sizeof(p));
 }
 
 void sendACK(){
-  uint8_t p[2] = {TYPE_ACK, DEVICE_ID};
-  send_now_to(replyMac(), p, sizeof(p));
+ uint8_t p[2] = {TYPE_ACK, DEVICE_ID};
+ send_now_to(replyMac(), p, sizeof(p));
 }
 
 void sendNAK(){
-  uint8_t p[2] = {TYPE_NAK, DEVICE_ID};
-  send_now_to(replyMac(), p, sizeof(p));
+ uint8_t p[2] = {TYPE_NAK, DEVICE_ID};
+ send_now_to(replyMac(), p, sizeof(p));
 }
 
 // ======== SIO hacia XF551 real ========
 
 // Envía un frame de 5 bytes a la XF551 con un pulso en /COMMAND
 void pulseCommandAndSendFrame(const uint8_t* frame5){
-  while (SerialSIO.available()) SerialSIO.read();
-  digitalWrite(SIO_COMMAND, LOW);
-  delayMicroseconds(2000);
-  SerialSIO.write(frame5, 5);
-  SerialSIO.flush();
-  delayMicroseconds(2500);
-  digitalWrite(SIO_COMMAND, HIGH);
+ while (SerialSIO.available()) SerialSIO.read();
+ digitalWrite(SIO_COMMAND, LOW);
+ delayMicroseconds(2000);
+ SerialSIO.write(frame5, 5);
+ SerialSIO.flush();
+ delayMicroseconds(2500);
+ digitalWrite(SIO_COMMAND, HIGH);
 }
 
 // Espera un byte concreto (ACK/COMPLETE), o NAK/ERROR, con timeout (ms)
 bool waitByte(uint8_t want, unsigned long timeoutMs){
-  unsigned long t0 = millis();
-  while (millis() - t0 < timeoutMs){
-    if (SerialSIO.available()){
-      uint8_t b = SerialSIO.read();
-      if (b == want) return true;
-      if (b == SIO_NAK && want != SIO_NAK) return false;
-      if (b == SIO_ERROR && want != SIO_ERROR) return false;
-    }
-    delay(1);
-  }
-  return false;
+ unsigned long t0 = millis();
+ while (millis() - t0 < timeoutMs){
+ if (SerialSIO.available()){
+ uint8_t b = SerialSIO.read();
+ if (b == want) return true;
+ if (b == SIO_NAK && want != SIO_NAK) return false;
+ if (b == SIO_ERROR && want != SIO_ERROR) return false;
+ }
+ delay(1);
+ }
+ return false;
 }
 
 // Lee 'sz' bytes desde la XF551 tras un COMPLETE, y traga el checksum
 bool readFromDrive(uint8_t* out, int sz, unsigned long timeoutMs){
-  if (!waitByte(SIO_COMPLETE, timeoutMs)) return false;
+ if (!waitByte(SIO_COMPLETE, timeoutMs)) return false;
 
-  int idx = 0;
-  unsigned long t1 = millis();
-  while (idx < sz && (millis() - t1) < timeoutMs){
-    if (SerialSIO.available()){
-      out[idx++] = SerialSIO.read();
-    } else {
-      delay(1);
-    }
-  }
-  if (idx != sz) return false;
+ int idx = 0;
+ unsigned long t1 = millis();
+ while (idx < sz && (millis() - t1) < timeoutMs){
+ if (SerialSIO.available()){
+ out[idx++] = SerialSIO.read();
+ } else {
+ delay(1);
+ }
+ }
+ if (idx != sz) return false;
 
-  // Tragar checksum si llega
-  unsigned long t2 = millis();
-  while (millis() - t2 < 50){
-    if (SerialSIO.available()){
-      (void)SerialSIO.read();
-      break;
-    }
-    delay(1);
-  }
-  return true;
+ // Tragar checksum si llega
+ unsigned long t2 = millis();
+ while (millis() - t2 < 50){
+ if (SerialSIO.available()){
+ (void)SerialSIO.read();
+ break;
+ }
+ delay(1);
+ }
+ return true;
 }
 
-// Lectura de sector desde XF551 (sin cache, solo helper)
+// Lectura de sector desde XF551 (sin cache, helper)
 int readSectorFromXF(uint8_t dev, uint16_t sec, bool dd, uint8_t* outBuf){
-  uint8_t frame[5];
-  frame[0] = dev;
-  frame[1] = 0x52; // READ
-  frame[2] = (uint8_t)(sec & 0xFF);
-  frame[3] = (uint8_t)(sec >> 8);
-  frame[4] = sioChecksum(frame, 4);
+ uint8_t frame[5];
+ frame[0] = dev;
+ frame[1] = 0x52; // READ
+ frame[2] = (uint8_t)(sec & 0xFF);
+ frame[3] = (uint8_t)(sec >> 8);
+ frame[4] = sioChecksum(frame, 4);
 
-  pulseCommandAndSendFrame(frame);
+ pulseCommandAndSendFrame(frame);
 
-  if (!waitByte(SIO_ACK, 4000)){
-    logf("[SLAVE D%u] READ: sin ACK del drive sec=%u",
-         (unsigned)(dev - 0x30), sec);
-    return 0;
-  }
+ if (!waitByte(SIO_ACK, 4000)){
+ logf("[SLAVE D%u] READ: sin ACK del drive sec=%u",
+ (unsigned)(dev - 0x30), sec);
+ return 0;
+ }
 
-  int sz = dd ? SECTOR_256 : SECTOR_128;
-  if (!readFromDrive(outBuf, sz, 8000)){
-    logf("[SLAVE D%u] READ: fallo lectura sec=%u",
-         (unsigned)(dev - 0x30), sec);
-    return 0;
-  }
+ int sz = dd ? SECTOR_256 : SECTOR_128;
+ if (!readFromDrive(outBuf, sz, 8000)){
+ logf("[SLAVE D%u] READ: fallo lectura sec=%u",
+ (unsigned)(dev - 0x30), sec);
+ return 0;
+ }
 
-  return sz;
+ return sz;
 }
 
-// CACHE helpers
-CacheEntry* cacheFind(uint8_t dev, uint16_t sec, bool dd){
-  for (int i = 0; i < MAX_PREFETCH_SECTORS; i++){
-    if (cache[i].valid &&
-        cache[i].dev == dev &&
-        cache[i].dd  == dd &&
-        cache[i].sec == sec){
-      return &cache[i];
-    }
-  }
-  return nullptr;
-}
+// Escritura de sector hacia XF551 (WRITE/WRITE+VERIFY)
+bool writeSectorToXF(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd, const uint8_t* buf, int len){
+ int expected = dd ? SECTOR_256 : SECTOR_128;
+ if (len < expected){
+ logf("[SLAVE D%u] WRITE: len=%d < esperado=%d, se rellenará con ceros",
+ (unsigned)(dev - 0x30), len, expected);
+ }
 
-CacheEntry* cacheAlloc(){
-  CacheEntry* e = &cache[cacheNext];
-  cacheNext = (cacheNext + 1) % MAX_PREFETCH_SECTORS;
-  e->valid = false;
-  return e;
-}
+ uint8_t frame[5];
+ frame[0] = dev;
+ frame[1] = cmd; // 0x50 o 0x57
+ frame[2] = (uint8_t)(sec & 0xFF);
+ frame[3] = (uint8_t)(sec >> 8);
+ frame[4] = sioChecksum(frame, 4);
 
-void cacheStore(uint8_t dev, uint16_t sec, bool dd, const uint8_t* data, int len){
-  if (len <= 0 || len > MAX_SECTOR_BYTES) return;
-  CacheEntry* e = cacheAlloc();
-  e->dev   = dev;
-  e->dd    = dd;
-  e->sec   = sec;
-  e->len   = len;
-  memcpy(e->data, data, len);
-  e->valid = true;
+ pulseCommandAndSendFrame(frame);
+
+ if (!waitByte(SIO_ACK, 4000)){
+ logf("[SLAVE D%u] WRITE: sin ACK del drive sec=%u",
+ (unsigned)(dev - 0x30), sec);
+ return false;
+ }
+
+ // Enviar datos (rellenando con 0 si falta)
+ uint8_t tmp[MAX_SECTOR_BYTES];
+ memset(tmp, 0, sizeof(tmp));
+ if (len > expected) len = expected;
+ memcpy(tmp, buf, len);
+
+ SerialSIO.write(tmp, expected);
+ SerialSIO.flush();
+
+ uint8_t chk = sioChecksum(tmp, expected);
+ SerialSIO.write(chk);
+ SerialSIO.flush();
+
+ if (!waitByte(SIO_COMPLETE, 20000)){
+ logf("[SLAVE D%u] WRITE: sin COMPLETE del drive sec=%u",
+ (unsigned)(dev - 0x30), sec);
+ return false;
+ }
+
+ logf("[SLAVE D%u] WRITE sec=%u (%s) OK",
+ (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+ return true;
 }
 
 // Envía DATA hacia el MASTER en uno o varios TYPE_SECTOR_CHUNK
 void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len){
-  uint8_t pkt[6 + CHUNK_PAYLOAD];
-  int cc = (len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
-  const uint8_t* mac = replyMac();
+ uint8_t pkt[6 + CHUNK_PAYLOAD];
+ int cc = (len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+ const uint8_t* mac = replyMac();
 
-  for (int i = 0; i < cc; i++){
-    int off = i * CHUNK_PAYLOAD;
-    int n   = min(CHUNK_PAYLOAD, len - off);
+ for (int i = 0; i < cc; i++){
+ int off = i * CHUNK_PAYLOAD;
+ int n = min(CHUNK_PAYLOAD, len - off);
 
-    pkt[0] = TYPE_SECTOR_CHUNK;
-    pkt[1] = DEVICE_ID;
-    pkt[2] = (uint8_t)(sec & 0xFF);
-    pkt[3] = (uint8_t)(sec >> 8);
-    pkt[4] = (uint8_t)i;     // chunk index
-    pkt[5] = (uint8_t)cc;    // chunk count
-    memcpy(pkt + 6, buf + off, n);
+ pkt[0] = TYPE_SECTOR_CHUNK;
+ pkt[1] = DEVICE_ID;
+ pkt[2] = (uint8_t)(sec & 0xFF);
+ pkt[3] = (uint8_t)(sec >> 8);
+ pkt[4] = (uint8_t)i; // chunk index
+ pkt[5] = (uint8_t)cc; // chunk count
+ memcpy(pkt + 6, buf + off, n);
 
-    send_now_to(mac, pkt, 6 + n);
-    delay(2);
-  }
+ send_now_to(mac, pkt, 6 + n);
+ delay(2);
+ }
 }
 
-// ======== HANDLERS LÓGICOS (READ / STATUS) ========
+// ======== HANDLERS LÓGICOS (READ / STATUS / FORMAT / WRITE) ========
 
-// READ con cache + prefetch N
-void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t prefetchCount){
-  if (prefetchCount > MAX_PREFETCH_SECTORS)
-    prefetchCount = MAX_PREFETCH_SECTORS;
+// READ con cache + prefetch multi-sector
+void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t pfCount){
+ uint8_t buf[MAX_SECTOR_BYTES];
+ int sz = dd ? SECTOR_256 : SECTOR_128;
+ bool servedFromCache = false;
 
-  uint8_t buf[MAX_SECTOR_BYTES];
-  int sz = 0;
+ if (cacheCount > 0 &&
+ cacheDev == dev &&
+ cacheDD == dd &&
+ sec >= cacheFirstSec &&
+ sec < (uint16_t)(cacheFirstSec + cacheCount)){
+ uint8_t idx = (uint8_t)(sec - cacheFirstSec);
+ memcpy(buf, cacheBuf[idx], sz);
+ servedFromCache = true;
+ logf("[SLAVE D%u] READ sec=%u desde CACHE (%s)",
+ (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+ }
 
-  // 1) Intentar cache
-  CacheEntry* c = cacheFind(dev, sec, dd);
-  if (c && c->len > 0){
-    sz = c->len;
-    memcpy(buf, c->data, sz);
-    logf("[SLAVE D%u] READ sec=%u desde CACHE (%s)",
-         (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
-  } else {
-    // 2) Leer desde XF551 real
-    logf("[SLAVE D%u] READ sec=%u (%s) desde DRIVE (pf=%u)",
-         (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", prefetchCount);
-    sz = readSectorFromXF(dev, sec, dd, buf);
-    if (sz <= 0){
-      sendNAK();
-      return;
-    }
-    // Guardar también este sector en cache
-    cacheStore(dev, sec, dd, buf, sz);
-  }
+ if (!servedFromCache){
+ logf("[SLAVE D%u] READ sec=%u (%s) desde DRIVE",
+ (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+ int r = readSectorFromXF(dev, sec, dd, buf);
+ if (r <= 0){
+ sendNAK();
+ cacheCount = 0;
+ return;
+ }
+ sz = r;
+ }
 
-  // 3) Responder al MASTER
-  sendACK();
-  sendSectorChunk(sec, buf, sz);
-  logf("[SLAVE D%u] READ sec=%u (%s) OK len=%d",
-       (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", sz);
+ sendACK();
+ sendSectorChunk(sec, buf, sz);
+ logf("[SLAVE D%u] READ sec=%u (%s) OK len=%d",
+ (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", sz);
 
-  // 4) PREFETCH sec+1..sec+N
-  if (prefetchCount > 0){
-    for (uint8_t i = 1; i <= prefetchCount; i++){
-      uint16_t nextSec = sec + i;
-      // Ver si ya está en cache
-      if (cacheFind(dev, nextSec, dd)){
-        logf("[SLAVE D%u][PREFETCH] sec=%u ya en cache, skip",
-             (unsigned)(dev - 0x30), nextSec);
-        continue;
-      }
+ // PREFETCH: construir nueva cache base + siguientes
+ if (pfCount == 0){
+ cacheCount = 0;
+ return;
+ }
 
-      uint8_t preBuf[MAX_SECTOR_BYTES];
-      int preLen = readSectorFromXF(dev, nextSec, dd, preBuf);
-      if (preLen > 0){
-        cacheStore(dev, nextSec, dd, preBuf, preLen);
-        logf("[SLAVE D%u][PREFETCH] sec=%u (%s) len=%d cacheado",
-             (unsigned)(dev - 0x30), nextSec, dd ? "DD" : "SD", preLen);
-      } else {
-        logf("[SLAVE D%u][PREFETCH] fallo lectura sec=%u",
-             (unsigned)(dev - 0x30), nextSec);
-        // No enviamos NAK por fallo de prefetch.
-      }
-    }
-  }
+ if (pfCount > MAX_PREFETCH_SECTORS) pfCount = MAX_PREFETCH_SECTORS;
+
+ memcpy(cacheBuf[0], buf, sz);
+ cacheFirstSec = sec;
+ cacheDev = dev;
+ cacheDD = dd;
+ cacheCount = 1;
+
+ for (uint8_t i = 1; i < pfCount; i++){
+ uint16_t nextSec = sec + i;
+ int r = readSectorFromXF(dev, nextSec, dd, cacheBuf[i]);
+ if (r != sz){
+ break;
+ }
+ cacheCount++;
+ logf("[SLAVE D%u][PREFETCH] sec=%u (%s) len=%d cacheado",
+ (unsigned)(dev - 0x30), nextSec, dd ? "DD" : "SD", r);
+ }
 }
 
 // STATUS (sin prefetch)
 void handleStatusFromMaster(uint8_t dev, bool dd){
-  (void)dd; // STATUS no usa densidad realmente
+ (void)dd; // STATUS no usa densidad realmente
 
-  uint8_t frame[5];
-  frame[0] = dev;
-  frame[1] = 0x53;
-  frame[2] = 0x00;
-  frame[3] = 0x00;
-  frame[4] = sioChecksum(frame, 4);
+ uint8_t frame[5];
+ frame[0] = dev;
+ frame[1] = 0x53;
+ frame[2] = 0x00;
+ frame[3] = 0x00;
+ frame[4] = sioChecksum(frame, 4);
 
-  pulseCommandAndSendFrame(frame);
+ pulseCommandAndSendFrame(frame);
 
-  if (!waitByte(SIO_ACK, 3000)){
-    logf("[SLAVE D%u] STATUS: sin ACK del drive", (unsigned)(dev - 0x30));
-    sendNAK();
-    return;
-  }
+ if (!waitByte(SIO_ACK, 3000)){
+ logf("[SLAVE D%u] STATUS: sin ACK del drive", (unsigned)(dev - 0x30));
+ sendNAK();
+ return;
+ }
 
-  uint8_t st[4];
-  if (!readFromDrive(st, 4, 5000)){
-    logf("[SLAVE D%u] STATUS: fallo lectura", (unsigned)(dev - 0x30));
-    sendNAK();
-    return;
-  }
+ uint8_t st[4];
+ if (!readFromDrive(st, 4, 5000)){
+ logf("[SLAVE D%u] STATUS: fallo lectura", (unsigned)(dev - 0x30));
+ sendNAK();
+ return;
+ }
 
-  sendACK();
-  sendSectorChunk(0, st, 4);
-  logf("[SLAVE D%u] STATUS -> %02X %02X %02X %02X",
-       (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
+ sendACK();
+ sendSectorChunk(0, st, 4);
+ logf("[SLAVE D%u] STATUS -> %02X %02X %02X %02X",
+ (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
+}
+
+// FORMAT (0x21) – la XF551 formatea y devuelve 128 o 256 bytes con lista de sectores malos
+void handleFormatFromMaster(uint8_t dev, uint16_t param, bool dd) {
+ // OJO: la XF551 decide densidad según configuración ($4F),
+ // pero usamos 'dd' para decidir si esperamos 128 o 256 bytes de resultado.
+ uint8_t aux1 = (uint8_t)(param & 0xFF);
+ uint8_t aux2 = (uint8_t)(param >> 8);
+
+ uint8_t frame[5];
+ frame[0] = dev;
+ frame[1] = 0x21; // FORMAT
+ frame[2] = aux1;
+ frame[3] = aux2;
+ frame[4] = sioChecksum(frame, 4);
+
+ logf("[SLAVE D%u] FORMAT: aux1=%u aux2=%u (dd=%u)",
+ (unsigned)(dev - 0x30), aux1, aux2, dd ? 1 : 0);
+
+ pulseCommandAndSendFrame(frame);
+
+ // Esperar ACK del drive real
+ if (!waitByte(SIO_ACK, 4000)) {
+ logf("[SLAVE D%u] FORMAT: sin ACK del drive", (unsigned)(dev - 0x30));
+ sendNAK();
+ return;
+ }
+
+ // Tamaño esperado del bloque de resultado:
+ // - 128 bytes en SD
+ // - 256 bytes en DD
+ int resultLen = dd ? SECTOR_256 : SECTOR_128;
+ if (resultLen > MAX_SECTOR_BYTES) {
+ resultLen = MAX_SECTOR_BYTES;
+ }
+
+ uint8_t fmt[MAX_SECTOR_BYTES];
+
+ // El FORMAT puede demorar mucho: subimos timeout a 90 segundos.
+ const unsigned long FORMAT_TIMEOUT_MS = 90000;
+
+ logf("[SLAVE D%u] FORMAT: esperando resultado (%d bytes, timeout=%lu ms)",
+ (unsigned)(dev - 0x30), resultLen, FORMAT_TIMEOUT_MS);
+
+ if (!readFromDrive(fmt, resultLen, FORMAT_TIMEOUT_MS)) {
+ logf("[SLAVE D%u] FORMAT: fallo lectura resultado", (unsigned)(dev - 0x30));
+ sendNAK();
+ return;
+ }
+
+ sendACK();
+ sendSectorChunk(0, fmt, resultLen);
+ logf("[SLAVE D%u] FORMAT OK (%d bytes resultado)",
+ (unsigned)(dev - 0x30), resultLen);
+
+ // Tras FORMAT invalidamos cache
+ cacheCount = 0;
+}
+
+
+// WRITE – usa DATA previamente recibida vía TYPE_SECTOR_CHUNK
+void handleWriteFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t cmd){
+ if (!writeBufReady || writeSec != sec){
+ logf("[SLAVE D%u] WRITE: datos no listos o sec mismatch (bufSec=%u cmdSec=%u)",
+ (unsigned)(dev - 0x30), writeSec, sec);
+ sendNAK();
+ return;
+ }
+
+ int len = writeLen;
+ bool ok = writeSectorToXF(dev, cmd, sec, dd, writeBuf, len);
+
+ if (ok){
+ sendACK();
+ } else {
+ sendNAK();
+ }
+
+ // Invalidar cache de lectura tras WRITE
+ cacheCount = 0;
+ writeBufReady = false;
+ writeLen = 0;
 }
 
 // ======== Callback ESP-NOW (SLAVE) ========
@@ -376,122 +471,211 @@ void handleStatusFromMaster(uint8_t dev, bool dd){
 #if ESP_IDF_VERSION_MAJOR >= 5
 
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len){
-  if (len <= 0 || !in) return;
+ if (len <= 0 || !in) return;
 
-  const uint8_t *src = info ? info->src_addr : nullptr;
+ const uint8_t *src = info ? info->src_addr : nullptr;
 
-  // Guardar MAC del master si no es broadcast
-  if (src){
-    bool isBcast = true;
-    for (int i = 0; i < 6; i++){
-      if (src[i] != 0xFF){ isBcast = false; break; }
-    }
-    if (!isBcast){
-      memcpy(g_lastMaster, src, 6);
-      g_haveMasterMac = true;
-      ensurePeer(g_lastMaster);
-    }
-  }
+ // Guardar MAC del master si no es broadcast
+ if (src){
+ bool isBcast = true;
+ for (int i = 0; i < 6; i++){
+ if (src[i] != 0xFF){ isBcast = false; break; }
+ }
+ if (!isBcast){
+ memcpy(g_lastMaster, src, 6);
+ g_haveMasterMac = true;
+ ensurePeer(g_lastMaster);
+ }
+ }
 
-  uint8_t type = in[0];
+ uint8_t type = in[0];
 
-  if (type == TYPE_CMD_FRAME && len >= 6){
-    uint8_t cmd  = in[1];
-    uint8_t dev  = in[2];
-    uint16_t sec = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
-    bool dd      = (in[5] != 0);
+ // Datos de WRITE desde MASTER (TYPE_SECTOR_CHUNK)
+ if (type == TYPE_SECTOR_CHUNK && len >= 6){
+ uint8_t dev = in[1];
+ uint16_t sec = (uint16_t)in[2] | ((uint16_t)in[3] << 8);
+ uint8_t ci = in[4];
+ uint8_t cc = in[5];
+ int payload = len - 6;
 
-    if (dev != DEVICE_ID) return;
+ if (dev != DEVICE_ID) return;
 
-    uint8_t base = cmd & 0x7F;
+ if (ci == 0){
+ memset(writeBuf, 0, sizeof(writeBuf));
+ writeSec = sec;
+ writeLen = 0;
+ writeBufReady = false;
+ }
 
-    // PrefetchCount opcional (si no viene, asumimos 1)
-    uint8_t prefetchCount = 1;
-    if (len >= 7){
-      prefetchCount = in[6];
-    }
+ int off = ci * CHUNK_PAYLOAD;
+ int copyLen = payload;
+ if (off + copyLen > MAX_SECTOR_BYTES)
+ copyLen = MAX_SECTOR_BYTES - off;
 
-    // READ
-    if (base == 0x52){
-      handleReadFromMaster(dev, sec, dd, prefetchCount);
-      return;
-    }
+ if (copyLen > 0){
+ memcpy(writeBuf + off, in + 6, copyLen);
+ writeLen += copyLen;
+ }
 
-    // STATUS (ignoramos prefetchCount)
-    if (base == 0x53){
-      handleStatusFromMaster(dev, dd);
-      return;
-    }
+ if (ci == (cc - 1)){
+ writeBufReady = true;
+ logf("[SLAVE D%u] WRITE DATA sec=%u len=%d chunks=%u",
+ (unsigned)(dev - 0x30), sec, writeLen, cc);
+ }
+ return;
+ }
 
-    // Otros comandos no soportados
-    sendNAK();
-    return;
-  }
+ if (type == TYPE_CMD_FRAME && len >= 6){
+ uint8_t cmd = in[1];
+ uint8_t dev = in[2];
+ uint16_t sec = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
+ bool dd = (in[5] != 0);
+ uint8_t pfCount = 1;
+ if (len >= 7) {
+ pfCount = in[6];
+ }
+
+ if (dev != DEVICE_ID) return;
+
+ uint8_t base = cmd & 0x7F;
+
+ // READ
+ if (base == 0x52){
+ handleReadFromMaster(dev, sec, dd, pfCount);
+ return;
+ }
+
+ // STATUS
+ if (base == 0x53){
+ handleStatusFromMaster(dev, dd);
+ return;
+ }
+
+ // FORMAT
+ if (base == 0x21){
+ handleFormatFromMaster(dev, sec, dd); // "sec" aquí es AUX1/2 empaquetado
+ return;
+ }
+
+ // WRITE (0x50 / 0x57)
+ if (base == 0x50 || base == 0x57){
+ handleWriteFromMaster(dev, sec, dd, cmd);
+ return;
+ }
+
+ // Otros comandos no soportados
+ sendNAK();
+ return;
+ }
 }
 
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t s){
-  (void)info;
-  if (s == ESP_NOW_SEND_SUCCESS)
-    Serial.println("[ESPNOW] Envío OK");
-  else
-    Serial.println("[ESPNOW] Falla en envío");
+ (void)info;
+ if (s == ESP_NOW_SEND_SUCCESS)
+ Serial.println("[ESPNOW] Envío OK");
+ else
+ Serial.println("[ESPNOW] Falla en envío");
 }
 
-#else  // ESP_IDF_VERSION_MAJOR < 5
+#else // ESP_IDF_VERSION_MAJOR < 5
 
 void onDataRecv(const uint8_t* src, const uint8_t* in, int len){
-  if (len <= 0 || !in) return;
+ if (len <= 0 || !in) return;
 
-  if (src){
-    bool isBcast = true;
-    for (int i = 0; i < 6; i++){
-      if (src[i] != 0xFF){ isBcast = false; break; }
-    }
-    if (!isBcast){
-      memcpy(g_lastMaster, src, 6);
-      g_haveMasterMac = true;
-      ensurePeer(g_lastMaster);
-    }
-  }
+ if (src){
+ bool isBcast = true;
+ for (int i = 0; i < 6; i++){
+ if (src[i] != 0xFF){ isBcast = false; break; }
+ }
+ if (!isBcast){
+ memcpy(g_lastMaster, src, 6);
+ g_haveMasterMac = true;
+ ensurePeer(g_lastMaster);
+ }
+ }
 
-  uint8_t type = in[0];
+ uint8_t type = in[0];
 
-  if (type == TYPE_CMD_FRAME && len >= 6){
-    uint8_t cmd  = in[1];
-    uint8_t dev  = in[2];
-    uint16_t sec = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
-    bool dd      = (in[5] != 0);
+ // Datos de WRITE desde MASTER (TYPE_SECTOR_CHUNK)
+ if (type == TYPE_SECTOR_CHUNK && len >= 6){
+ uint8_t dev = in[1];
+ uint16_t sec = (uint16_t)in[2] | ((uint16_t)in[3] << 8);
+ uint8_t ci = in[4];
+ uint8_t cc = in[5];
+ int payload = len - 6;
 
-    if (dev != DEVICE_ID) return;
+ if (dev != DEVICE_ID) return;
 
-    uint8_t base = cmd & 0x7F;
+ if (ci == 0){
+ memset(writeBuf, 0, sizeof(writeBuf));
+ writeSec = sec;
+ writeLen = 0;
+ writeBufReady = false;
+ }
 
-    uint8_t prefetchCount = 1;
-    if (len >= 7){
-      prefetchCount = in[6];
-    }
+ int off = ci * CHUNK_PAYLOAD;
+ int copyLen = payload;
+ if (off + copyLen > MAX_SECTOR_BYTES)
+ copyLen = MAX_SECTOR_BYTES - off;
 
-    if (base == 0x52){
-      handleReadFromMaster(dev, sec, dd, prefetchCount);
-      return;
-    }
+ if (copyLen > 0){
+ memcpy(writeBuf + off, in + 6, copyLen);
+ writeLen += copyLen;
+ }
 
-    if (base == 0x53){
-      handleStatusFromMaster(dev, dd);
-      return;
-    }
+ if (ci == (cc - 1)){
+ writeBufReady = true;
+ logf("[SLAVE D%u] WRITE DATA sec=%u len=%d chunks=%u",
+ (unsigned)(dev - 0x30), sec, writeLen, cc);
+ }
+ return;
+ }
 
-    sendNAK();
-    return;
-  }
+ if (type == TYPE_CMD_FRAME && len >= 6){
+ uint8_t cmd = in[1];
+ uint8_t dev = in[2];
+ uint16_t sec = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
+ bool dd = (in[5] != 0);
+ uint8_t pfCount = 1;
+ if (len >= 7) {
+ pfCount = in[6];
+ }
+
+ if (dev != DEVICE_ID) return;
+
+ uint8_t base = cmd & 0x7F;
+
+ if (base == 0x52){
+ handleReadFromMaster(dev, sec, dd, pfCount);
+ return;
+ }
+
+ if (base == 0x53){
+ handleStatusFromMaster(dev, dd);
+ return;
+ }
+
+ if (base == 0x21){
+ handleFormatFromMaster(dev, sec, dd); // "sec" aquí es AUX1/2 empaquetado
+ return;
+ }
+
+ if (base == 0x50 || base == 0x57){
+ handleWriteFromMaster(dev, sec, dd, cmd);
+ return;
+ }
+
+ sendNAK();
+ return;
+ }
 }
 
 void onDataSent(const uint8_t* mac, esp_now_send_status_t s){
-  (void)mac;
-  if (s == ESP_NOW_SEND_SUCCESS)
-    Serial.println("[ESPNOW] Envío OK");
-  else
-    Serial.println("[ESPNOW] Falla en envío");
+ (void)mac;
+ if (s == ESP_NOW_SEND_SUCCESS)
+ Serial.println("[ESPNOW] Envío OK");
+ else
+ Serial.println("[ESPNOW] Falla en envío");
 }
 
 #endif
@@ -499,40 +683,37 @@ void onDataSent(const uint8_t* mac, esp_now_send_status_t s){
 // ======== SETUP / LOOP ========
 
 void setup(){
-  Serial.begin(115200);
-  Serial.printf("\n[SLAVE] XF551 STATUS+READ+PREFETCH DEV=0x%02X\n", DEVICE_ID);
+ Serial.begin(115200);
+ Serial.printf("\n[SLAVE] XF551 STATUS+READ+FORMAT+WRITE+PREFETCH DEV=0x%02X\n", DEVICE_ID);
 
-  SerialSIO.begin(19200, SERIAL_8N1, SIO_RX, SIO_TX);
-  pinMode(SIO_COMMAND, OUTPUT);
-  digitalWrite(SIO_COMMAND, HIGH);
+ SerialSIO.begin(19200, SERIAL_8N1, SIO_RX, SIO_TX);
+ pinMode(SIO_COMMAND, OUTPUT);
+ digitalWrite(SIO_COMMAND, HIGH);
 
-  // Init cache
-  for (int i = 0; i < MAX_PREFETCH_SECTORS; i++){
-    cache[i].valid = false;
-  }
-  cacheNext = 0;
+ WiFi.mode(WIFI_STA);
+ if (esp_now_init() != ESP_OK){
+ Serial.println("[ERR] esp_now_init falló");
+ ESP.restart();
+ }
 
-  WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK){
-    Serial.println("[ERR] esp_now_init falló");
-    ESP.restart();
-  }
+ esp_now_register_recv_cb(onDataRecv);
+ esp_now_register_send_cb(onDataSent);
 
-  esp_now_register_recv_cb(onDataRecv);
-  esp_now_register_send_cb(onDataSent);
+ ensurePeer(BCAST_MAC);
+ sendHello();
 
-  ensurePeer(BCAST_MAC);
-  sendHello();
+ cacheCount = 0;
+ writeBufReady = false;
+ writeLen = 0;
 
-  logf("[SLAVE] Listo DEV=0x%02X DD=%u (MAX_PREFETCH_SECTORS=%u)",
-       DEVICE_ID, supports256 ? 1 : 0, MAX_PREFETCH_SECTORS);
+ logf("[SLAVE] Listo DEV=0x%02X DD=%u", DEVICE_ID, supports256 ? 1 : 0);
 }
 
 void loop(){
-  static unsigned long t0 = 0;
-  if (millis() - t0 > 60000){
-    sendHello();
-    t0 = millis();
-  }
-  delay(10);
+ static unsigned long t0 = 0;
+ if (millis() - t0 > 60000){
+ sendHello();
+ t0 = millis();
+ }
+ delay(10);
 }
