@@ -1,12 +1,19 @@
 /*******************************************************
- * SLAVE MINIMO – XF551 REAL – STATUS + READ + PREFETCH
+ * SLAVE – XF551 REAL – STATUS + READ + PREFETCH N
  * - Conecta una XF551 real por SIO
  * - DEVICE_ID = 0x31..0x34 (D1..D4)
  * - Soporta:
  *    • STATUS (0x53)
- *    • READ SECTOR (0x52) con prefetch de sec+1
+ *    • READ SECTOR (0x52) con prefetch configurable
  * - Protocolo ESP-NOW:
- *    • Recibe TYPE_CMD_FRAME
+ *    • Recibe TYPE_CMD_FRAME:
+ *        [0]=TYPE_CMD_FRAME
+ *        [1]=cmd
+ *        [2]=dev
+ *        [3]=secL
+ *        [4]=secH
+ *        [5]=dens (!=0=DD)
+ *        [6]=prefetchCount (opcional; si no viene, asumimos 1)
  *    • Devuelve TYPE_SECTOR_CHUNK (para STATUS y READ)
  *    • Envía HELLO al arrancar
  *******************************************************/
@@ -16,6 +23,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
+#include <stdarg.h>
 
 // ======== SIO hacia XF551 (MASTER SIO) ========
 #define SIO_RX       16   // desde XF551
@@ -42,23 +50,31 @@ HardwareSerial SerialSIO(2);
 #define SECTOR_128        128
 #define SECTOR_256        256
 
+// Prefetch máximo que soporta este SLAVE
+#define MAX_PREFETCH_SECTORS 4
+
 // Configura este valor según la unidad que quieras emular:
 const uint8_t DEVICE_ID   = 0x31;   // 0x31=D1, 0x32=D2, 0x33=D3, 0x34=D4
 const bool    supports256 = true;   // la XF551 real soporta DD
 
-const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF};
+const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 // Último master conocido (para responder unicast si llega unicast)
 uint8_t g_lastMaster[6] = {0};
 bool    g_haveMasterMac = false;
 
-// ======== PREFETCH CACHE ========
-static uint8_t  cacheBuf[MAX_SECTOR_BYTES];
-static uint16_t cacheSec   = 0xFFFF;
-static uint8_t  cacheDev   = 0;
-static int      cacheLen   = 0;
-static bool     cacheValid = false;
-static bool     cacheDD    = false;
+// ======== CACHE multi-sector para PREFETCH ========
+struct CacheEntry {
+  bool     valid;
+  uint8_t  dev;
+  bool     dd;
+  uint16_t sec;
+  int      len;
+  uint8_t  data[MAX_SECTOR_BYTES];
+};
+
+CacheEntry cache[MAX_PREFETCH_SECTORS];
+uint8_t    cacheNext = 0;
 
 // ======== Utilidades ========
 
@@ -66,10 +82,11 @@ void logf(const char* fmt, ...){
   char b[256];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(b, sizeof(b), fmt, ap);
+  vsnprintf(b, sizeof(b), fmt, ap);  // usar fmt aquí
   va_end(ap);
   Serial.println(b);
 }
+
 
 uint8_t sioChecksum(const uint8_t* d, int len){
   uint16_t s = 0;
@@ -87,7 +104,10 @@ void ensurePeer(const uint8_t* mac){
   memcpy(p.peer_addr, mac, 6);
   p.channel = 0;
   p.encrypt = false;
-  esp_now_add_peer(&p);
+  esp_err_t e = esp_now_add_peer(&p);
+  if (e != ESP_OK){
+    logf("[ESPNOW] esp_now_add_peer error=%d", (int)e);
+  }
 }
 
 const uint8_t* replyMac(){
@@ -96,7 +116,11 @@ const uint8_t* replyMac(){
 
 bool send_now_to(const uint8_t* mac, const uint8_t* data, int len){
   ensurePeer(mac);
-  return (esp_now_send(mac, data, len) == ESP_OK);
+  esp_err_t e = esp_now_send(mac, data, len);
+  if (e != ESP_OK){
+    logf("[ESPNOW] esp_now_send error=%d", (int)e);
+  }
+  return (e == ESP_OK);
 }
 
 void sendHello(){
@@ -199,6 +223,37 @@ int readSectorFromXF(uint8_t dev, uint16_t sec, bool dd, uint8_t* outBuf){
   return sz;
 }
 
+// CACHE helpers
+CacheEntry* cacheFind(uint8_t dev, uint16_t sec, bool dd){
+  for (int i = 0; i < MAX_PREFETCH_SECTORS; i++){
+    if (cache[i].valid &&
+        cache[i].dev == dev &&
+        cache[i].dd  == dd &&
+        cache[i].sec == sec){
+      return &cache[i];
+    }
+  }
+  return nullptr;
+}
+
+CacheEntry* cacheAlloc(){
+  CacheEntry* e = &cache[cacheNext];
+  cacheNext = (cacheNext + 1) % MAX_PREFETCH_SECTORS;
+  e->valid = false;
+  return e;
+}
+
+void cacheStore(uint8_t dev, uint16_t sec, bool dd, const uint8_t* data, int len){
+  if (len <= 0 || len > MAX_SECTOR_BYTES) return;
+  CacheEntry* e = cacheAlloc();
+  e->dev   = dev;
+  e->dd    = dd;
+  e->sec   = sec;
+  e->len   = len;
+  memcpy(e->data, data, len);
+  e->valid = true;
+}
+
 // Envía DATA hacia el MASTER en uno o varios TYPE_SECTOR_CHUNK
 void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len){
   uint8_t pkt[6 + CHUNK_PAYLOAD];
@@ -224,27 +279,32 @@ void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len){
 
 // ======== HANDLERS LÓGICOS (READ / STATUS) ========
 
-// READ con cache + prefetch
-void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd){
+// READ con cache + prefetch N
+void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t prefetchCount){
+  if (prefetchCount > MAX_PREFETCH_SECTORS)
+    prefetchCount = MAX_PREFETCH_SECTORS;
+
   uint8_t buf[MAX_SECTOR_BYTES];
   int sz = 0;
 
   // 1) Intentar cache
-  if (cacheValid && cacheDev == dev && cacheSec == sec && cacheDD == dd){
-    sz = cacheLen;
-    memcpy(buf, cacheBuf, sz);
+  CacheEntry* c = cacheFind(dev, sec, dd);
+  if (c && c->len > 0){
+    sz = c->len;
+    memcpy(buf, c->data, sz);
     logf("[SLAVE D%u] READ sec=%u desde CACHE (%s)",
          (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
   } else {
     // 2) Leer desde XF551 real
-    logf("[SLAVE D%u] READ sec=%u (%s) desde DRIVE",
-         (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+    logf("[SLAVE D%u] READ sec=%u (%s) desde DRIVE (pf=%u)",
+         (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", prefetchCount);
     sz = readSectorFromXF(dev, sec, dd, buf);
     if (sz <= 0){
       sendNAK();
-      cacheValid = false;
       return;
     }
+    // Guardar también este sector en cache
+    cacheStore(dev, sec, dd, buf, sz);
   }
 
   // 3) Responder al MASTER
@@ -253,22 +313,29 @@ void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd){
   logf("[SLAVE D%u] READ sec=%u (%s) OK len=%d",
        (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", sz);
 
-  // 4) PREFETCH sec+1
-  uint16_t nextSec = sec + 1;
-  uint8_t preBuf[MAX_SECTOR_BYTES];
-  int preLen = readSectorFromXF(dev, nextSec, dd, preBuf);
-  if (preLen > 0){
-    memcpy(cacheBuf, preBuf, preLen);
-    cacheDev   = dev;
-    cacheSec   = nextSec;
-    cacheLen   = preLen;
-    cacheDD    = dd;
-    cacheValid = true;
+  // 4) PREFETCH sec+1..sec+N
+  if (prefetchCount > 0){
+    for (uint8_t i = 1; i <= prefetchCount; i++){
+      uint16_t nextSec = sec + i;
+      // Ver si ya está en cache
+      if (cacheFind(dev, nextSec, dd)){
+        logf("[SLAVE D%u][PREFETCH] sec=%u ya en cache, skip",
+             (unsigned)(dev - 0x30), nextSec);
+        continue;
+      }
 
-    logf("[SLAVE D%u][PREFETCH] sec=%u (%s) len=%d cacheado",
-         (unsigned)(dev - 0x30), nextSec, dd ? "DD" : "SD", preLen);
-  } else {
-    cacheValid = false;
+      uint8_t preBuf[MAX_SECTOR_BYTES];
+      int preLen = readSectorFromXF(dev, nextSec, dd, preBuf);
+      if (preLen > 0){
+        cacheStore(dev, nextSec, dd, preBuf, preLen);
+        logf("[SLAVE D%u][PREFETCH] sec=%u (%s) len=%d cacheado",
+             (unsigned)(dev - 0x30), nextSec, dd ? "DD" : "SD", preLen);
+      } else {
+        logf("[SLAVE D%u][PREFETCH] fallo lectura sec=%u",
+             (unsigned)(dev - 0x30), nextSec);
+        // No enviamos NAK por fallo de prefetch.
+      }
+    }
   }
 }
 
@@ -338,13 +405,19 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len){
 
     uint8_t base = cmd & 0x7F;
 
+    // PrefetchCount opcional (si no viene, asumimos 1)
+    uint8_t prefetchCount = 1;
+    if (len >= 7){
+      prefetchCount = in[6];
+    }
+
     // READ
     if (base == 0x52){
-      handleReadFromMaster(dev, sec, dd);
+      handleReadFromMaster(dev, sec, dd, prefetchCount);
       return;
     }
 
-    // STATUS
+    // STATUS (ignoramos prefetchCount)
     if (base == 0x53){
       handleStatusFromMaster(dev, dd);
       return;
@@ -393,8 +466,13 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len){
 
     uint8_t base = cmd & 0x7F;
 
+    uint8_t prefetchCount = 1;
+    if (len >= 7){
+      prefetchCount = in[6];
+    }
+
     if (base == 0x52){
-      handleReadFromMaster(dev, sec, dd);
+      handleReadFromMaster(dev, sec, dd, prefetchCount);
       return;
     }
 
@@ -422,11 +500,17 @@ void onDataSent(const uint8_t* mac, esp_now_send_status_t s){
 
 void setup(){
   Serial.begin(115200);
-  Serial.printf("\n[SLAVE] MINIMO XF551 STATUS+READ+PREFETCH DEV=0x%02X\n", DEVICE_ID);
+  Serial.printf("\n[SLAVE] XF551 STATUS+READ+PREFETCH DEV=0x%02X\n", DEVICE_ID);
 
   SerialSIO.begin(19200, SERIAL_8N1, SIO_RX, SIO_TX);
   pinMode(SIO_COMMAND, OUTPUT);
   digitalWrite(SIO_COMMAND, HIGH);
+
+  // Init cache
+  for (int i = 0; i < MAX_PREFETCH_SECTORS; i++){
+    cache[i].valid = false;
+  }
+  cacheNext = 0;
 
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK){
@@ -440,9 +524,8 @@ void setup(){
   ensurePeer(BCAST_MAC);
   sendHello();
 
-  cacheValid = false;
-
-  logf("[SLAVE] Listo DEV=0x%02X DD=%u", DEVICE_ID, supports256 ? 1 : 0);
+  logf("[SLAVE] Listo DEV=0x%02X DD=%u (MAX_PREFETCH_SECTORS=%u)",
+       DEVICE_ID, supports256 ? 1 : 0, MAX_PREFETCH_SECTORS);
 }
 
 void loop(){

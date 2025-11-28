@@ -1,12 +1,23 @@
 /*******************************************************
- * MASTER MINIMO – STATUS + READ (D1..D4)
+ * MASTER – STATUS + READ (D1..D4) + WEB UI + PREFETCH
  * - Emula D1..D4 (0x31..0x34) frente al Atari
  * - Soporta STATUS (0x53) y READ SECTOR (0x52)
  * - Usa ESP-NOW para delegar en SLAVES con XF551 real
  * - Protocolo:
  *    • Cada SLAVE manda HELLO (TYPE_HELLO) con dev y soporte DD
- *    • MASTER manda TYPE_CMD_FRAME a D1..D4
+ *    • MASTER manda TYPE_CMD_FRAME a D1..D4:
+ *        [0]=TYPE_CMD_FRAME
+ *        [1]=cmd
+ *        [2]=dev
+ *        [3]=secL
+ *        [4]=secH
+ *        [5]=dens (!=0=DD)
+ *        [6]=prefetchCount (#sectores adelantados)
  *    • SLAVE responde con TYPE_SECTOR_CHUNK
+ * - Web UI (HTTP en puerto 80, AP "XF551_MASTER" / "xf551wifi"):
+ *    • Ver estado de disqueteras (SLAVES)
+ *    • Ajustar tiempos SIO
+ *    • Ajustar prefetch por unidad (0..4 sectores)
  *******************************************************/
 
 #include <Arduino.h>
@@ -14,6 +25,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
+#include <WebServer.h>
+#include <stdarg.h>
 
 // ========= Config SIO MASTER (lado Atari) =========
 #define SIO_DATA_IN   16
@@ -46,11 +59,14 @@ HardwareSerial SerialSIO(2);
 
 #define CHUNK_PAYLOAD     240
 
-// ========= Timings simples SIO (µs) =========
-const uint16_t T_ACK_TO_COMPLETE   = 2000;
-const uint16_t T_COMPLETE_TO_DATA  = 1600;
-const uint16_t T_DATA_TO_CHK       = 400;
-const uint16_t T_CHUNK_DELAY       = 1600;
+// Prefetch máximo que vamos a permitir configurar
+#define MAX_PREFETCH_SECTORS 4
+
+// ========= Timings SIO (µs) – AJUSTABLES POR WEB =========
+uint16_t T_ACK_TO_COMPLETE   = 2000;
+uint16_t T_COMPLETE_TO_DATA  = 1600;
+uint16_t T_DATA_TO_CHK       = 400;
+uint16_t T_CHUNK_DELAY       = 1600;
 
 // ========= Estado de SLAVES (uno por unidad) =========
 struct SlaveInfo {
@@ -62,6 +78,9 @@ struct SlaveInfo {
 
 SlaveInfo slaves[4]; // D1..D4
 
+// Prefetch configurado por unidad (0..MAX_PREFETCH_SECTORS)
+uint8_t prefetchCfg[4] = {1, 1, 1, 1};
+
 int devIndex(uint8_t dev){
   if (dev < DEV_MIN || dev > DEV_MAX) return -1;
   return dev - DEV_MIN; // 0..3
@@ -71,6 +90,12 @@ const char* devName(uint8_t dev){
   static const char* names[] = {"D1", "D2", "D3", "D4"};
   int idx = devIndex(dev);
   return (idx >= 0) ? names[idx] : "UNK";
+}
+
+uint8_t prefetchForDev(uint8_t dev){
+  int idx = devIndex(dev);
+  if (idx < 0) return 0;
+  return prefetchCfg[idx];
 }
 
 // ========= Estado de operación remota =========
@@ -93,9 +118,12 @@ volatile uint8_t  receivedChunks   = 0;
 uint8_t           replyBuf[MAX_SECTOR_BYTES];
 
 // ========= Otros =========
-const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF};
+const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-// ========= Pequeñas utilidades de log =========
+// ========= WebServer =========
+WebServer server(80);
+
+// ========= Utilidades varias =========
 
 uint8_t sioChecksum(const uint8_t* d, int len){
   uint16_t s = 0;
@@ -110,10 +138,11 @@ void logf(const char* fmt, ...){
   char buf[256];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
+  vsnprintf(buf, sizeof(buf), fmt, ap);  // <-- acá va fmt, no ap
   va_end(ap);
   Serial.println(buf);
 }
+
 
 void logHex(const char* prefix, const uint8_t* data, int len, int maxBytes = 16){
   Serial.print(prefix);
@@ -133,7 +162,10 @@ void ensurePeer(const uint8_t* mac){
   memcpy(p.peer_addr, mac, 6);
   p.channel = 0;
   p.encrypt = false;
-  esp_now_add_peer(&p);
+  esp_err_t e = esp_now_add_peer(&p);
+  if (e != ESP_OK){
+    logf("[ESPNOW] esp_now_add_peer error=%d", (int)e);
+  }
 }
 
 const uint8_t* macForDev(uint8_t dev){
@@ -141,6 +173,178 @@ const uint8_t* macForDev(uint8_t dev){
   if (idx < 0) return BCAST_MAC;
   if (!slaves[idx].present) return BCAST_MAC;
   return slaves[idx].mac;
+}
+
+String formatMac(const uint8_t mac[6]){
+  char buf[32];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+// ========= Web UI Handlers =========
+
+void handleRoot(){
+  String html;
+  html.reserve(6000);
+
+  html += F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<title>XF551 WIFI MASTER</title>"
+    "<style>"
+    "body{font-family:Arial,Helvetica,sans-serif;background:#202124;color:#e8eaed;margin:0;padding:0;}"
+    "h1,h2{margin:16px;}"
+    "section{margin:16px;padding:16px;background:#303134;border-radius:8px;}"
+    "table{border-collapse:collapse;width:100%;}"
+    "th,td{border:1px solid #555;padding:6px 8px;font-size:13px;text-align:left;}"
+    "th{background:#3c4043;}"
+    "input[type='number']{width:90px;}"
+    "input[type='submit']{margin-top:8px;padding:6px 12px;border:none;border-radius:4px;background:#1a73e8;color:#fff;cursor:pointer;}"
+    "input[type='submit']:hover{background:#1664c4;}"
+    "label{margin-right:8px;display:inline-block;margin-top:4px;}"
+    "</style></head><body>"
+  );
+
+  html += F("<h1>XF551 WIFI MASTER - Panel</h1>");
+
+  // ====== SECCIÓN ESTADO DE DISQUETERAS ======
+  html += F("<section><h2>Estado de disqueteras (SLAVES)</h2>");
+  html += F("<table><tr><th>Unidad</th><th>Presente</th><th>MAC</th><th>DD</th><th>Último HELLO (ms)</th><th>Prefetch</th></tr>");
+
+  unsigned long now = millis();
+  for (uint8_t dev = DEV_MIN; dev <= DEV_MAX; dev++){
+    int idx = devIndex(dev);
+    if (idx < 0) continue;
+
+    html += F("<tr><td>");
+    html += devName(dev);
+    html += F("</td>");
+
+    bool present = slaves[idx].present;
+    html += F("<td>");
+    html += present ? F("SI") : F("NO");
+    html += F("</td>");
+
+    html += F("<td>");
+    if (present){
+      html += formatMac(slaves[idx].mac);
+    } else {
+      html += F("-");
+    }
+    html += F("</td>");
+
+    html += F("<td>");
+    html += (slaves[idx].supports256 ? F("DD") : F("SD"));
+    html += F("</td>");
+
+    html += F("<td>");
+    if (present){
+      unsigned long age = now - slaves[idx].lastSeen;
+      html += String(age);
+    } else {
+      html += F("-");
+    }
+    html += F("</td>");
+
+    html += F("<td>");
+    html += String(prefetchCfg[idx]);
+    html += F("</td></tr>");
+  }
+  html += F("</table>");
+  html += F("<p>Refresca la página para actualizar el estado.</p>");
+  html += F("</section>");
+
+  // ====== SECCIÓN CONFIG TIMINGS ======
+  html += F("<section><h2>Configuración de tiempos SIO (μs)</h2>");
+  html += F("<form method='GET' action='/set_timing'>");
+
+  html += F("<label>ACK → COMPLETE: <input type='number' name='t_ack' min='0' max='10000' value='");
+  html += String(T_ACK_TO_COMPLETE);
+  html += F("'></label><br>");
+
+  html += F("<label>COMPLETE → DATA: <input type='number' name='t_comp' min='0' max='10000' value='");
+  html += String(T_COMPLETE_TO_DATA);
+  html += F("'></label><br>");
+
+  html += F("<label>DATA → CHK: <input type='number' name='t_chk' min='0' max='5000' value='");
+  html += String(T_DATA_TO_CHK);
+  html += F("'></label><br>");
+
+  html += F("<label>CHUNK DELAY: <input type='number' name='t_chunk' min='0' max='10000' value='");
+  html += String(T_CHUNK_DELAY);
+  html += F("'></label><br>");
+
+  html += F("<input type='submit' value='Guardar tiempos'>");
+  html += F("</form>");
+  html += F("</section>");
+
+  // ====== SECCIÓN PREFETCH POR UNIDAD ======
+  html += F("<section><h2>Prefetch por unidad (sectores adelantados)</h2>");
+  html += F("<form method='GET' action='/set_prefetch'>");
+
+  for (uint8_t dev = DEV_MIN; dev <= DEV_MAX; dev++){
+    int idx = devIndex(dev);
+    if (idx < 0) continue;
+    html += F("<label>");
+    html += devName(dev);
+    html += F(" prefetch: <input type='number' name='pf");
+    html += String(idx + 1);
+    html += F("' min='0' max='");
+    html += String(MAX_PREFETCH_SECTORS);
+    html += F("' value='");
+    html += String(prefetchCfg[idx]);
+    html += F("'></label><br>");
+  }
+
+  html += F("<input type='submit' value='Guardar prefetch'>");
+  html += F("</form>");
+  html += F("<p><small>0 = sin prefetch, 1..");
+  html += String(MAX_PREFETCH_SECTORS);
+  html += F(" = cantidad de sectores que el SLAVE leerá por adelantado.</small></p>");
+  html += F("</section>");
+
+  html += F("</body></html>");
+
+  server.send(200, "text/html", html);
+}
+
+void handleSetTiming(){
+  if (server.hasArg("t_ack")){
+    T_ACK_TO_COMPLETE = (uint16_t)server.arg("t_ack").toInt();
+  }
+  if (server.hasArg("t_comp")){
+    T_COMPLETE_TO_DATA = (uint16_t)server.arg("t_comp").toInt();
+  }
+  if (server.hasArg("t_chk")){
+    T_DATA_TO_CHK = (uint16_t)server.arg("t_chk").toInt();
+  }
+  if (server.hasArg("t_chunk")){
+    T_CHUNK_DELAY = (uint16_t)server.arg("t_chunk").toInt();
+  }
+
+  logf("[WEB] Tiempos: ACK->COMP=%u, COMP->DATA=%u, DATA->CHK=%u, CHUNK=%u",
+       T_ACK_TO_COMPLETE, T_COMPLETE_TO_DATA, T_DATA_TO_CHK, T_CHUNK_DELAY);
+
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "OK");
+}
+
+void handleSetPrefetch(){
+  for (int idx = 0; idx < 4; idx++){
+    String argName = "pf" + String(idx + 1);
+    if (server.hasArg(argName)){
+      int v = server.arg(argName).toInt();
+      if (v < 0) v = 0;
+      if (v > MAX_PREFETCH_SECTORS) v = MAX_PREFETCH_SECTORS;
+      prefetchCfg[idx] = (uint8_t)v;
+    }
+  }
+
+  logf("[WEB] Prefetch: D1=%u, D2=%u, D3=%u, D4=%u",
+       prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
+
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "OK");
 }
 
 // ========= Lógica común de recepción/envío ESP-NOW =========
@@ -161,9 +365,8 @@ static void handleEspNowRecvCommon(const uint8_t* mac, const uint8_t* data, int 
       memcpy(slaves[idx].mac, mac, 6);
       slaves[idx].lastSeen    = millis();
       ensurePeer(slaves[idx].mac);
-      logf("[HELLO] %s presente DD=%u MAC=%02X:%02X:%02X:%02X:%02X:%02X",
-           devName(dev), s256,
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      logf("[HELLO] %s presente DD=%u MAC=%s",
+           devName(dev), s256, formatMac(slaves[idx].mac).c_str());
     }
     return;
   }
@@ -176,7 +379,6 @@ static void handleEspNowRecvCommon(const uint8_t* mac, const uint8_t* data, int 
     uint8_t cc   = data[5];
     int payload  = len - 6;
 
-    // Solo aceptamos si coincide con la operación en curso
     if (dev != currentOpDev || currentOpType == OP_NONE) return;
 
     if (ci == 0){
@@ -238,7 +440,7 @@ void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status){
   handleEspNowSentCommon(status);
 }
 
-#else  // IDF < 5 (firmware antiguos)
+#else  // IDF < 5
 
 void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
   handleEspNowRecvCommon(mac, data, len);
@@ -253,23 +455,30 @@ void onDataSent(const uint8_t* mac, esp_now_send_status_t status){
 
 // ========= Envío de comandos al SLAVE =========
 
-// [0]=TYPE_CMD_FRAME,[1]=cmd,[2]=dev,[3]=secL,[4]=secH,[5]=dens
+// [0]=TYPE_CMD_FRAME,[1]=cmd,[2]=dev,[3]=secL,[4]=secH,[5]=dens,[6]=prefetchCount
 bool sendCmd(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd){
-  uint8_t p[6];
+  uint8_t p[7];
   p[0] = TYPE_CMD_FRAME;
   p[1] = cmd;
   p[2] = dev;
   p[3] = (uint8_t)(sec & 0xFF);
   p[4] = (uint8_t)(sec >> 8);
   p[5] = dd ? 1 : 0;
+  uint8_t pf = prefetchForDev(dev);
+  if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
+  p[6] = pf;
 
   const uint8_t* dest = macForDev(dev);
 
-  logf("[ESPNOW][TX] CMD_FRAME dev=%s cmd=0x%02X sec=%u dd=%s",
-       devName(dev), cmd, sec, dd ? "DD" : "SD");
+  logf("[ESPNOW][TX] CMD_FRAME dev=%s cmd=0x%02X sec=%u dd=%s pf=%u",
+       devName(dev), cmd, sec, dd ? "DD" : "SD", pf);
   logHex("[ESPNOW][TX] bytes:", p, sizeof(p));
 
-  return (esp_now_send(dest, p, sizeof(p)) == ESP_OK);
+  esp_err_t e = esp_now_send(dest, p, sizeof(p));
+  if (e != ESP_OK){
+    logf("[ESPNOW] esp_now_send error=%d", (int)e);
+  }
+  return (e == ESP_OK);
 }
 
 // Lee sector remoto (128/256) para dev dado
@@ -324,6 +533,8 @@ int readRemoteSector(uint8_t dev, uint16_t sec, bool dd, uint8_t* out){
 
 // Lee STATUS remoto (4 bytes) para dev dado
 int readRemoteStatus(uint8_t dev, bool dd, uint8_t* out4){
+  (void)dd; // no usamos densidad para STATUS de momento
+
   int idx = devIndex(dev);
   if (idx < 0 || !slaves[idx].present){
     logf("[STATUS] %s no presente", devName(dev));
@@ -339,10 +550,10 @@ int readRemoteStatus(uint8_t dev, bool dd, uint8_t* out4){
   currentOpDev  = dev;
   currentOpSec  = 0;
 
-  logf("[STATUS] Solicitando STATUS dd=%s a %s",
-       dd ? "DD" : "SD", devName(dev));
+  logf("[STATUS] Solicitando STATUS a %s", devName(dev));
 
-  if (!sendCmd(dev, 0x53, 0, dd)){
+  // Para STATUS ignoramos prefetch, mandamos pf=0 internamente en el SLAVE
+  if (!sendCmd(dev, 0x53, 0, false)){
     logf("[STATUS] sendCmd falló para %s", devName(dev));
     currentOpType = OP_NONE;
     return 0;
@@ -421,7 +632,6 @@ void handleSioHeader(uint8_t f[5]){
 
   // 2) Filtramos dispositivos que no sean D1..D4
   if (dev < DEV_MIN || dev > DEV_MAX){
-    // Ignoramos totalmente (para evitar "tanda basura")
     return;
   }
 
@@ -487,7 +697,7 @@ uint32_t cmdStartMicros = 0;
 
 void setup(){
   Serial.begin(115200);
-  Serial.println("\n[MASTER] MINIMAL STATUS+READ D1..D4");
+  Serial.println("\n[MASTER] STATUS+READ + WEB UI + PREFETCH D1..D4");
 
   pinMode(SIO_COMMAND, INPUT_PULLUP);
   SerialSIO.begin(19200, SERIAL_8N1, SIO_DATA_IN, SIO_DATA_OUT, false);
@@ -500,7 +710,18 @@ void setup(){
     slaves[i].lastSeen    = 0;
   }
 
-  WiFi.mode(WIFI_STA);
+  // WiFi AP+STA para Web UI + ESP-NOW
+  WiFi.mode(WIFI_AP_STA);
+  const char* apSsid = "XF551_MASTER";
+  const char* apPass = "xf551wifi";
+  WiFi.softAP(apSsid, apPass);
+
+  Serial.print("[WIFI] AP SSID: ");
+  Serial.println(apSsid);
+  Serial.print("[WIFI] AP IP:   ");
+  Serial.println(WiFi.softAPIP());
+
+  // ESP-NOW
   if (esp_now_init() != ESP_OK){
     Serial.println("[ERR] esp_now_init falló");
     ESP.restart();
@@ -509,10 +730,20 @@ void setup(){
   esp_now_register_send_cb(onDataSent);
 
   ensurePeer(BCAST_MAC);
+
+  // WebServer rutas
+  server.on("/", handleRoot);
+  server.on("/set_timing", handleSetTiming);
+  server.on("/set_prefetch", handleSetPrefetch);
+  server.begin();
+  Serial.println("[WEB] Servidor HTTP iniciado en puerto 80");
 }
 
 void loop(){
-  // Limpiar esclavos inactivos (por ejemplo > 60s sin HELLO)
+  // Atender Web UI
+  server.handleClient();
+
+  // Limpiar esclavos inactivos (>60s sin HELLO)
   unsigned long now = millis();
   for (int i = 0; i < 4; i++){
     if (slaves[i].present && (now - slaves[i].lastSeen > 60000)){
@@ -539,7 +770,6 @@ void loop(){
     if (hdrCount == 5){
       handleSioHeader(hdrBuf);
       inCommand = false;
-      // Limpiar residuos de este comando
       while (SerialSIO.available()) SerialSIO.read();
     }
 
