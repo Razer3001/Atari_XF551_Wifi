@@ -47,10 +47,10 @@ HardwareSerial SerialSIO(2);
 #define CHUNK_PAYLOAD     240
 
 // ========= Timings simples SIO (µs) =========
-const uint16_t T_ACK_TO_COMPLETE   = 1000;
-const uint16_t T_COMPLETE_TO_DATA  = 600;
-const uint16_t T_DATA_TO_CHK       = 200;
-const uint16_t T_CHUNK_DELAY       = 600;
+const uint16_t T_ACK_TO_COMPLETE   = 2000;
+const uint16_t T_COMPLETE_TO_DATA  = 1600;
+const uint16_t T_DATA_TO_CHK       = 400;
+const uint16_t T_CHUNK_DELAY       = 1600;
 
 // ========= Estado de SLAVES (uno por unidad) =========
 struct SlaveInfo {

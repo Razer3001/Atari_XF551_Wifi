@@ -1,10 +1,10 @@
 /*******************************************************
- * SLAVE MINIMO – XF551 REAL – STATUS + READ
+ * SLAVE MINIMO – XF551 REAL – STATUS + READ + PREFETCH
  * - Conecta una XF551 real por SIO
  * - DEVICE_ID = 0x31..0x34 (D1..D4)
  * - Soporta:
  *    • STATUS (0x53)
- *    • READ SECTOR (0x52)
+ *    • READ SECTOR (0x52) con prefetch de sec+1
  * - Protocolo ESP-NOW:
  *    • Recibe TYPE_CMD_FRAME
  *    • Devuelve TYPE_SECTOR_CHUNK (para STATUS y READ)
@@ -51,6 +51,14 @@ const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF};
 // Último master conocido (para responder unicast si llega unicast)
 uint8_t g_lastMaster[6] = {0};
 bool    g_haveMasterMac = false;
+
+// ======== PREFETCH CACHE ========
+static uint8_t  cacheBuf[MAX_SECTOR_BYTES];
+static uint16_t cacheSec   = 0xFFFF;
+static uint8_t  cacheDev   = 0;
+static int      cacheLen   = 0;
+static bool     cacheValid = false;
+static bool     cacheDD    = false;
 
 // ======== Utilidades ========
 
@@ -164,6 +172,33 @@ bool readFromDrive(uint8_t* out, int sz, unsigned long timeoutMs){
   return true;
 }
 
+// Lectura de sector desde XF551 (sin cache, solo helper)
+int readSectorFromXF(uint8_t dev, uint16_t sec, bool dd, uint8_t* outBuf){
+  uint8_t frame[5];
+  frame[0] = dev;
+  frame[1] = 0x52; // READ
+  frame[2] = (uint8_t)(sec & 0xFF);
+  frame[3] = (uint8_t)(sec >> 8);
+  frame[4] = sioChecksum(frame, 4);
+
+  pulseCommandAndSendFrame(frame);
+
+  if (!waitByte(SIO_ACK, 4000)){
+    logf("[SLAVE D%u] READ: sin ACK del drive sec=%u",
+         (unsigned)(dev - 0x30), sec);
+    return 0;
+  }
+
+  int sz = dd ? SECTOR_256 : SECTOR_128;
+  if (!readFromDrive(outBuf, sz, 8000)){
+    logf("[SLAVE D%u] READ: fallo lectura sec=%u",
+         (unsigned)(dev - 0x30), sec);
+    return 0;
+  }
+
+  return sz;
+}
+
 // Envía DATA hacia el MASTER en uno o varios TYPE_SECTOR_CHUNK
 void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len){
   uint8_t pkt[6 + CHUNK_PAYLOAD];
@@ -185,6 +220,88 @@ void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len){
     send_now_to(mac, pkt, 6 + n);
     delay(2);
   }
+}
+
+// ======== HANDLERS LÓGICOS (READ / STATUS) ========
+
+// READ con cache + prefetch
+void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd){
+  uint8_t buf[MAX_SECTOR_BYTES];
+  int sz = 0;
+
+  // 1) Intentar cache
+  if (cacheValid && cacheDev == dev && cacheSec == sec && cacheDD == dd){
+    sz = cacheLen;
+    memcpy(buf, cacheBuf, sz);
+    logf("[SLAVE D%u] READ sec=%u desde CACHE (%s)",
+         (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+  } else {
+    // 2) Leer desde XF551 real
+    logf("[SLAVE D%u] READ sec=%u (%s) desde DRIVE",
+         (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+    sz = readSectorFromXF(dev, sec, dd, buf);
+    if (sz <= 0){
+      sendNAK();
+      cacheValid = false;
+      return;
+    }
+  }
+
+  // 3) Responder al MASTER
+  sendACK();
+  sendSectorChunk(sec, buf, sz);
+  logf("[SLAVE D%u] READ sec=%u (%s) OK len=%d",
+       (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", sz);
+
+  // 4) PREFETCH sec+1
+  uint16_t nextSec = sec + 1;
+  uint8_t preBuf[MAX_SECTOR_BYTES];
+  int preLen = readSectorFromXF(dev, nextSec, dd, preBuf);
+  if (preLen > 0){
+    memcpy(cacheBuf, preBuf, preLen);
+    cacheDev   = dev;
+    cacheSec   = nextSec;
+    cacheLen   = preLen;
+    cacheDD    = dd;
+    cacheValid = true;
+
+    logf("[SLAVE D%u][PREFETCH] sec=%u (%s) len=%d cacheado",
+         (unsigned)(dev - 0x30), nextSec, dd ? "DD" : "SD", preLen);
+  } else {
+    cacheValid = false;
+  }
+}
+
+// STATUS (sin prefetch)
+void handleStatusFromMaster(uint8_t dev, bool dd){
+  (void)dd; // STATUS no usa densidad realmente
+
+  uint8_t frame[5];
+  frame[0] = dev;
+  frame[1] = 0x53;
+  frame[2] = 0x00;
+  frame[3] = 0x00;
+  frame[4] = sioChecksum(frame, 4);
+
+  pulseCommandAndSendFrame(frame);
+
+  if (!waitByte(SIO_ACK, 3000)){
+    logf("[SLAVE D%u] STATUS: sin ACK del drive", (unsigned)(dev - 0x30));
+    sendNAK();
+    return;
+  }
+
+  uint8_t st[4];
+  if (!readFromDrive(st, 4, 5000)){
+    logf("[SLAVE D%u] STATUS: fallo lectura", (unsigned)(dev - 0x30));
+    sendNAK();
+    return;
+  }
+
+  sendACK();
+  sendSectorChunk(0, st, 4);
+  logf("[SLAVE D%u] STATUS -> %02X %02X %02X %02X",
+       (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
 }
 
 // ======== Callback ESP-NOW (SLAVE) ========
@@ -221,66 +338,15 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len){
 
     uint8_t base = cmd & 0x7F;
 
-    // ===== READ SECTOR =====
+    // READ
     if (base == 0x52){
-      uint8_t frame[5];
-      frame[0] = dev;
-      frame[1] = 0x52;
-      frame[2] = (uint8_t)(sec & 0xFF);
-      frame[3] = (uint8_t)(sec >> 8);
-      frame[4] = sioChecksum(frame, 4);
-
-      pulseCommandAndSendFrame(frame);
-
-      if (!waitByte(SIO_ACK, 4000)){
-        logf("[SLAVE D%u] READ: sin ACK del drive", (unsigned)(dev - 0x30));
-        sendNAK();
-        return;
-      }
-
-      int sz = dd ? SECTOR_256 : SECTOR_128;
-      uint8_t buf[MAX_SECTOR_BYTES];
-
-      if (!readFromDrive(buf, sz, 8000)){
-        logf("[SLAVE D%u] READ: fallo lectura sec=%u", (unsigned)(dev - 0x30), sec);
-        sendNAK();
-        return;
-      }
-
-      sendACK();
-      sendSectorChunk(sec, buf, sz);
-      logf("[SLAVE D%u] READ sec=%u (%s) OK", (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+      handleReadFromMaster(dev, sec, dd);
       return;
     }
 
-    // ===== STATUS =====
+    // STATUS
     if (base == 0x53){
-      uint8_t frame[5];
-      frame[0] = dev;
-      frame[1] = 0x53;
-      frame[2] = 0x00;
-      frame[3] = 0x00;
-      frame[4] = sioChecksum(frame, 4);
-
-      pulseCommandAndSendFrame(frame);
-
-      if (!waitByte(SIO_ACK, 3000)){
-        logf("[SLAVE D%u] STATUS: sin ACK del drive", (unsigned)(dev - 0x30));
-        sendNAK();
-        return;
-      }
-
-      uint8_t st[4];
-      if (!readFromDrive(st, 4, 5000)){
-        logf("[SLAVE D%u] STATUS: fallo lectura", (unsigned)(dev - 0x30));
-        sendNAK();
-        return;
-      }
-
-      sendACK();
-      sendSectorChunk(0, st, 4);
-      logf("[SLAVE D%u] STATUS -> %02X %02X %02X %02X",
-           (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
+      handleStatusFromMaster(dev, dd);
       return;
     }
 
@@ -328,63 +394,12 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len){
     uint8_t base = cmd & 0x7F;
 
     if (base == 0x52){
-      uint8_t frame[5];
-      frame[0] = dev;
-      frame[1] = 0x52;
-      frame[2] = (uint8_t)(sec & 0xFF);
-      frame[3] = (uint8_t)(sec >> 8);
-      frame[4] = sioChecksum(frame, 4);
-
-      pulseCommandAndSendFrame(frame);
-
-      if (!waitByte(SIO_ACK, 4000)){
-        logf("[SLAVE D%u] READ: sin ACK del drive", (unsigned)(dev - 0x30));
-        sendNAK();
-        return;
-      }
-
-      int sz = dd ? SECTOR_256 : SECTOR_128;
-      uint8_t buf[MAX_SECTOR_BYTES];
-
-      if (!readFromDrive(buf, sz, 8000)){
-        logf("[SLAVE D%u] READ: fallo lectura sec=%u", (unsigned)(dev - 0x30), sec);
-        sendNAK();
-        return;
-      }
-
-      sendACK();
-      sendSectorChunk(sec, buf, sz);
-      logf("[SLAVE D%u] READ sec=%u (%s) OK", (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+      handleReadFromMaster(dev, sec, dd);
       return;
     }
 
     if (base == 0x53){
-      uint8_t frame[5];
-      frame[0] = dev;
-      frame[1] = 0x53;
-      frame[2] = 0x00;
-      frame[3] = 0x00;
-      frame[4] = sioChecksum(frame, 4);
-
-      pulseCommandAndSendFrame(frame);
-
-      if (!waitByte(SIO_ACK, 3000)){
-        logf("[SLAVE D%u] STATUS: sin ACK del drive", (unsigned)(dev - 0x30));
-        sendNAK();
-        return;
-      }
-
-      uint8_t st[4];
-      if (!readFromDrive(st, 4, 5000)){
-        logf("[SLAVE D%u] STATUS: fallo lectura", (unsigned)(dev - 0x30));
-        sendNAK();
-        return;
-      }
-
-      sendACK();
-      sendSectorChunk(0, st, 4);
-      logf("[SLAVE D%u] STATUS -> %02X %02X %02X %02X",
-           (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
+      handleStatusFromMaster(dev, dd);
       return;
     }
 
@@ -407,7 +422,7 @@ void onDataSent(const uint8_t* mac, esp_now_send_status_t s){
 
 void setup(){
   Serial.begin(115200);
-  Serial.printf("\n[SLAVE] MINIMO XF551 STATUS+READ DEV=0x%02X\n", DEVICE_ID);
+  Serial.printf("\n[SLAVE] MINIMO XF551 STATUS+READ+PREFETCH DEV=0x%02X\n", DEVICE_ID);
 
   SerialSIO.begin(19200, SERIAL_8N1, SIO_RX, SIO_TX);
   pinMode(SIO_COMMAND, OUTPUT);
@@ -424,6 +439,8 @@ void setup(){
 
   ensurePeer(BCAST_MAC);
   sendHello();
+
+  cacheValid = false;
 
   logf("[SLAVE] Listo DEV=0x%02X DD=%u", DEVICE_ID, supports256 ? 1 : 0);
 }
