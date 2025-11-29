@@ -1,19 +1,21 @@
 /*******************************************************
- * MASTER – STATUS + READ + FORMAT + WRITE (D1..D4) + WEB UI + PREFETCH + NVS
+ * MASTER – STATUS + READ + FORMAT + WRITE + PERCOM (D1..D4) + WEB UI + PREFETCH + NVS
  * - Emula D1..D4 (0x31..0x34) frente al Atari
  * - Soporta:
- * • STATUS (0x53)
- * • READ SECTOR (0x52)
- * • FORMAT (0x21)
- * • WRITE SECTOR (0x50 / 0x57)
+ *   • STATUS (0x53)
+ *   • READ SECTOR (0x52)
+ *   • FORMAT (0x21 / 0x22)
+ *   • WRITE SECTOR (0x50 / 0x57)
+ *   • READ PERCOM BLOCK (0x4E)
+ *   • WRITE PERCOM BLOCK (0x4F)
  * - Usa ESP-NOW para delegar en SLAVES con XF551 real
  * - Web UI (HTTP en puerto 80, AP "XF551_MASTER" / "xf551wifi"):
- * • Ver estado de disqueteras (SLAVES)
- * • Ajustar tiempos SIO
- * • Ajustar prefetch por unidad (0..MAX_PREFETCH_SECTORS)
+ *   • Ver estado de disqueteras (SLAVES)
+ *   • Ajustar tiempos SIO
+ *   • Ajustar prefetch por unidad (0..MAX_PREFETCH_SECTORS)
  * - Configuración persistente (NVS):
- * • Tiempos SIO
- * • Prefetch D1..D4
+ *   • Tiempos SIO
+ *   • Prefetch D1..D4
  *******************************************************/
 
 #include <Arduino.h>
@@ -23,7 +25,7 @@
 #include <HardwareSerial.h>
 #include <WebServer.h>
 #include <stdarg.h>
-#include <Preferences.h> // <<< NVS para guardar configuración
+#include <Preferences.h> // NVS para guardar configuración
 
 // ========= Config SIO MASTER (lado Atari) =========
 #define SIO_DATA_IN 16
@@ -33,26 +35,27 @@
 HardwareSerial SerialSIO(2);
 
 // Códigos SIO
-#define SIO_ACK 0x41
-#define SIO_NAK 0x4E
+#define SIO_ACK      0x41
+#define SIO_NAK      0x4E
 #define SIO_COMPLETE 0x43
-#define SIO_ERROR 0x45
+#define SIO_ERROR    0x45
 
 // D1..D4
 #define DEV_MIN 0x31
-#define DEV_MAX 0x34
+#define DEV_MAX 0x38
 
 // Tamaños
-#define SECTOR_128 128
-#define SECTOR_256 256
+#define SECTOR_128       128
+#define SECTOR_256       256
 #define MAX_SECTOR_BYTES 256
+#define PERCOM_BLOCK_LEN 12   // Tamaño estándar del Percom block
 
 // ========= Protocolo ESP-NOW =========
-#define TYPE_HELLO 0x20
-#define TYPE_CMD_FRAME 0x01
+#define TYPE_HELLO        0x20
+#define TYPE_CMD_FRAME    0x01
 #define TYPE_SECTOR_CHUNK 0x10
-#define TYPE_ACK 0x11
-#define TYPE_NAK 0x12
+#define TYPE_ACK          0x11
+#define TYPE_NAK          0x12
 
 #define CHUNK_PAYLOAD 240
 
@@ -61,65 +64,65 @@ HardwareSerial SerialSIO(2);
 
 // ========= Timings SIO (µs) – AJUSTABLES POR WEB =========
 // Valores por defecto (si no hay nada en NVS)
-uint16_t T_ACK_TO_COMPLETE = 2000;
-uint16_t T_COMPLETE_TO_DATA = 1600;
-uint16_t T_DATA_TO_CHK = 400;
-uint16_t T_CHUNK_DELAY = 1600;
+uint16_t T_ACK_TO_COMPLETE   = 2000;
+uint16_t T_COMPLETE_TO_DATA  = 1600;
+uint16_t T_DATA_TO_CHK       = 400;
+uint16_t T_CHUNK_DELAY       = 1600;
 
 // ========= Estado de SLAVES (uno por unidad) =========
 struct SlaveInfo {
- bool present;
- bool supports256;
- uint8_t mac[6];
- unsigned long lastSeen;
+  bool present;
+  bool supports256;
+  uint8_t mac[6];
+  unsigned long lastSeen;
 };
 
 SlaveInfo slaves[4]; // D1..D4
 
 // Prefetch configurado por unidad (0..MAX_PREFETCH_SECTORS)
-// Valores por defecto si no hay nada en NVS
 uint8_t prefetchCfg[4] = {1, 1, 1, 1};
 
 int devIndex(uint8_t dev){
- if (dev < DEV_MIN || dev > DEV_MAX) return -1;
- return dev - DEV_MIN; // 0..3
+  if (dev < DEV_MIN || dev > DEV_MAX) return -1;
+  return dev - DEV_MIN; // 0..3
 }
 
 const char* devName(uint8_t dev){
- static const char* names[] = {"D1", "D2", "D3", "D4"};
- int idx = devIndex(dev);
- return (idx >= 0) ? names[idx] : "UNK";
+  static const char* names[] = {"D1", "D2", "D3", "D4"};
+  int idx = devIndex(dev);
+  return (idx >= 0) ? names[idx] : "UNK";
 }
 
 uint8_t prefetchForDev(uint8_t dev){
- int idx = devIndex(dev);
- if (idx < 0) return 0;
- return prefetchCfg[idx];
+  int idx = devIndex(dev);
+  if (idx < 0) return 0;
+  return prefetchCfg[idx];
 }
 
 // ========= Estado de operación remota =========
 enum OpType : uint8_t {
- OP_NONE = 0,
- OP_READ = 1,
- OP_STATUS = 2,
- OP_FORMAT = 3
+  OP_NONE    = 0,
+  OP_READ    = 1,
+  OP_STATUS  = 2,
+  OP_FORMAT  = 3,
+  OP_PERCOM  = 4   // READ PERCOM
 };
 
-volatile OpType currentOpType = OP_NONE;
-volatile uint8_t currentOpDev = 0;
-volatile uint16_t currentOpSec = 0;
+volatile OpType   currentOpType = OP_NONE;
+volatile uint8_t  currentOpDev  = 0;
+volatile uint16_t currentOpSec  = 0;
 
 // ========= Buffers de respuesta (desde SLAVES) =========
-volatile bool replyReady = false;
-volatile uint16_t replySec = 0;
-volatile uint16_t replyLen = 0;
-volatile uint8_t expectedChunks = 0;
-volatile uint8_t receivedChunks = 0;
-uint8_t replyBuf[MAX_SECTOR_BYTES];
+volatile bool     replyReady       = false;
+volatile uint16_t replySec         = 0;
+volatile uint16_t replyLen         = 0;
+volatile uint8_t  expectedChunks   = 0;
+volatile uint8_t  receivedChunks   = 0;
+uint8_t           replyBuf[MAX_SECTOR_BYTES];
 
-// ========= Seguimiento de ACK/NAK remotos (para WRITE/FORMAT) =========
+// ========= Seguimiento de ACK/NAK remotos (para WRITE/FORMAT/PERCOM) =========
 volatile bool lastAckDone = false;
-volatile bool lastAckOk = false;
+volatile bool lastAckOk   = false;
 
 // ========= Otros =========
 const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -461,33 +464,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
  }
 
  async function saveConfig() {
- try {
- const cfg = collectConfig();
- const pf = mapPrefetchByDev(cfg.drives);
+  try {
+    const cfg = collectConfig();
+    const pf = mapPrefetchByDev(cfg.drives);
 
- setStatus("Guardando configuración...", true);
+    setStatus("Guardando configuración...", true);
 
- const urlTiming =
- `/set_timing?t_ack=${cfg.timings.ackToComplete}` +
- `&t_comp=${cfg.timings.completeToData}` +
- `&t_chk=${cfg.timings.dataToChk}` +
- `&t_chunk=${cfg.timings.chunkDelay}`;
+    const urlTiming =
+      `/set_timing?t_ack=${cfg.timings.ackToComplete}` +
+      `&t_comp=${cfg.timings.completeToData}` +
+      `&t_chk=${cfg.timings.dataToChk}` +
+      `&t_chunk=${cfg.timings.chunkDelay}`;
 
- const urlPrefetch =
- `/set_prefetch?pf1=${pf.D1}&pf2=${pf.D2}&pf3=${pf.D3}&pf4=${pf.D4}`;
+    const urlPrefetch =
+      `/set_prefetch?pf1=${pf.D1}&pf2=${pf.D2}&pf3=${pf.D3}&pf4=${pf.D4}`;
 
- const r1 = await fetch(urlTiming);
- if (!r1.ok) throw new Error("Error en /set_timing (" + r1.status + ")");
+    const r1 = await fetch(urlTiming);
+    if (!r1.ok) throw new Error("Error en /set_timing (" + r1.status + ")");
 
- const r2 = await fetch(urlPrefetch);
- if (!r2.ok) throw new Error("Error en /set_prefetch (" + r2.status + ")");
+    const r2 = await fetch(urlPrefetch);
+    if (!r2.ok) throw new Error("Error en /set_prefetch (" + r2.status + ")");
 
- setStatus("Configuración guardada. Recargando estado...");
- await loadStatus();
- } catch (e) {
- console.error(e);
- setStatus("Error al guardar configuración: " + e.message, false);
- }
+    setStatus("Configuración guardada. Recargando estado...");
+    await loadStatus();
+  } catch (e) {
+    console.error(e);
+    setStatus("Error al guardar configuración: " + e.message, false);
+  }
  }
 
  document.addEventListener("DOMContentLoaded", () => {
@@ -503,361 +506,346 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 // ========= Utilidades varias =========
 
 uint8_t sioChecksum(const uint8_t* d, int len){
- uint16_t s = 0;
- for (int i = 0; i < len; i++){
- s += d[i];
- if (s > 0xFF) s = (s & 0xFF) + 1;
- }
- return s & 0xFF;
+  uint16_t s = 0;
+  for (int i = 0; i < len; i++){
+    s += d[i];
+    if (s > 0xFF) s = (s & 0xFF) + 1;
+  }
+  return s & 0xFF;
 }
 
-// *** logf CORREGIDO ***
 void logf(const char* fmt, ...){
- char buf[256];
- va_list ap;
- va_start(ap, fmt);
- vsnprintf(buf, sizeof(buf), fmt, ap); // <- aquí va 'fmt'
- va_end(ap);
- Serial.println(buf);
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.println(buf);
 }
 
 void logHex(const char* prefix, const uint8_t* data, int len, int maxBytes = 16){
- Serial.print(prefix);
- int n = (len < maxBytes) ? len : maxBytes;
- for (int i = 0; i < n; i++){
- Serial.print(' ');
- if (data[i] < 0x10) Serial.print('0');
- Serial.print(data[i], HEX);
- }
- Serial.println();
+  Serial.print(prefix);
+  int n = (len < maxBytes) ? len : maxBytes;
+  for (int i = 0; i < n; i++){
+    Serial.print(' ');
+    if (data[i] < 0x10) Serial.print('0');
+    Serial.print(data[i], HEX);
+  }
+  Serial.println();
 }
 
 void ensurePeer(const uint8_t* mac){
- if (!mac) return;
- if (esp_now_is_peer_exist(mac)) return;
- esp_now_peer_info_t p = {};
- memcpy(p.peer_addr, mac, 6);
- p.channel = 0;
- p.encrypt = false;
- esp_err_t e = esp_now_add_peer(&p);
- if (e != ESP_OK){
- logf("[ESPNOW] esp_now_add_peer error=%d", (int)e);
- }
+  if (!mac) return;
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t p = {};
+  memcpy(p.peer_addr, mac, 6);
+  p.channel = 0;
+  p.encrypt = false;
+  esp_err_t e = esp_now_add_peer(&p);
+  if (e != ESP_OK){
+    logf("[ESPNOW] esp_now_add_peer error=%d", (int)e);
+  }
 }
 
 const uint8_t* macForDev(uint8_t dev){
- int idx = devIndex(dev);
- if (idx < 0) return BCAST_MAC;
- if (!slaves[idx].present) return BCAST_MAC;
- return slaves[idx].mac;
+  int idx = devIndex(dev);
+  if (idx < 0) return BCAST_MAC;
+  if (!slaves[idx].present) return BCAST_MAC;
+  return slaves[idx].mac;
 }
 
 String formatMac(const uint8_t mac[6]){
- char buf[32];
- sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
- mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
- return String(buf);
+  char buf[32];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
 }
 
 // ========= NVS: cargar/guardar configuración =========
 
 void saveTimingConfigToNvs(){
- if (!prefs.begin("xf551cfg", false)) {
- logf("[NVS] Error al abrir NVS para tiempos");
- return;
- }
- prefs.putUInt("magic", CFG_MAGIC);
- prefs.putUShort("t_ack", T_ACK_TO_COMPLETE);
- prefs.putUShort("t_comp", T_COMPLETE_TO_DATA);
- prefs.putUShort("t_chk", T_DATA_TO_CHK);
- prefs.putUShort("t_chd", T_CHUNK_DELAY);
- prefs.end();
- logf("[NVS] Tiempos guardados");
+  if (!prefs.begin("xf551cfg", false)) {
+    logf("[NVS] Error al abrir NVS para tiempos");
+    return;
+  }
+  prefs.putUInt("magic", CFG_MAGIC);
+  prefs.putUShort("t_ack",  T_ACK_TO_COMPLETE);
+  prefs.putUShort("t_comp", T_COMPLETE_TO_DATA);
+  prefs.putUShort("t_chk",  T_DATA_TO_CHK);
+  prefs.putUShort("t_chd",  T_CHUNK_DELAY);
+  prefs.end();
+  logf("[NVS] Tiempos guardados");
 }
 
 void savePrefetchConfigToNvs(){
- if (!prefs.begin("xf551cfg", false)) {
- logf("[NVS] Error al abrir NVS para prefetch");
- return;
- }
- prefs.putUInt("magic", CFG_MAGIC);
- prefs.putUChar("pf1", prefetchCfg[0]);
- prefs.putUChar("pf2", prefetchCfg[1]);
- prefs.putUChar("pf3", prefetchCfg[2]);
- prefs.putUChar("pf4", prefetchCfg[3]);
- prefs.end();
- logf("[NVS] Prefetch guardado");
+  if (!prefs.begin("xf551cfg", false)) {
+    logf("[NVS] Error al abrir NVS para prefetch");
+    return;
+  }
+  prefs.putUInt("magic", CFG_MAGIC);
+  prefs.putUChar("pf1", prefetchCfg[0]);
+  prefs.putUChar("pf2", prefetchCfg[1]);
+  prefs.putUChar("pf3", prefetchCfg[2]);
+  prefs.putUChar("pf4", prefetchCfg[3]);
+  prefs.end();
+  logf("[NVS] Prefetch guardado");
 }
 
 void loadConfigFromNvs(){
- // Config por defecto ya está en las variables globales
- if (!prefs.begin("xf551cfg", false)) {
- logf("[NVS] No se pudo abrir NVS, uso defaults");
- return;
- }
+  if (!prefs.begin("xf551cfg", false)) {
+    logf("[NVS] No se pudo abrir NVS, uso defaults");
+    return;
+  }
 
- uint32_t magic = prefs.getUInt("magic", 0);
- if (magic != CFG_MAGIC) {
- // Primera vez: grabamos defaults
- prefs.putUInt("magic", CFG_MAGIC);
- prefs.putUShort("t_ack", T_ACK_TO_COMPLETE);
- prefs.putUShort("t_comp", T_COMPLETE_TO_DATA);
- prefs.putUShort("t_chk", T_DATA_TO_CHK);
- prefs.putUShort("t_chd", T_CHUNK_DELAY);
- prefs.putUChar("pf1", prefetchCfg[0]);
- prefs.putUChar("pf2", prefetchCfg[1]);
- prefs.putUChar("pf3", prefetchCfg[2]);
- prefs.putUChar("pf4", prefetchCfg[3]);
- prefs.end();
- logf("[NVS] Config inicial grabada (defaults)");
- return;
- }
+  uint32_t magic = prefs.getUInt("magic", 0);
+  if (magic != CFG_MAGIC) {
+    prefs.putUInt("magic", CFG_MAGIC);
+    prefs.putUShort("t_ack",  T_ACK_TO_COMPLETE);
+    prefs.putUShort("t_comp", T_COMPLETE_TO_DATA);
+    prefs.putUShort("t_chk",  T_DATA_TO_CHK);
+    prefs.putUShort("t_chd",  T_CHUNK_DELAY);
+    prefs.putUChar("pf1", prefetchCfg[0]);
+    prefs.putUChar("pf2", prefetchCfg[1]);
+    prefs.putUChar("pf3", prefetchCfg[2]);
+    prefs.putUChar("pf4", prefetchCfg[3]);
+    prefs.end();
+    logf("[NVS] Config inicial grabada (defaults)");
+    return;
+  }
 
- // Ya había config guardada: la leemos
- T_ACK_TO_COMPLETE = prefs.getUShort("t_ack", T_ACK_TO_COMPLETE);
- T_COMPLETE_TO_DATA = prefs.getUShort("t_comp", T_COMPLETE_TO_DATA);
- T_DATA_TO_CHK = prefs.getUShort("t_chk", T_DATA_TO_CHK);
- T_CHUNK_DELAY = prefs.getUShort("t_chd", T_CHUNK_DELAY);
+  T_ACK_TO_COMPLETE   = prefs.getUShort("t_ack",  T_ACK_TO_COMPLETE);
+  T_COMPLETE_TO_DATA  = prefs.getUShort("t_comp", T_COMPLETE_TO_DATA);
+  T_DATA_TO_CHK       = prefs.getUShort("t_chk",  T_DATA_TO_CHK);
+  T_CHUNK_DELAY       = prefs.getUShort("t_chd",  T_CHUNK_DELAY);
 
- prefetchCfg[0] = prefs.getUChar("pf1", prefetchCfg[0]);
- prefetchCfg[1] = prefs.getUChar("pf2", prefetchCfg[1]);
- prefetchCfg[2] = prefs.getUChar("pf3", prefetchCfg[2]);
- prefetchCfg[3] = prefs.getUChar("pf4", prefetchCfg[3]);
+  prefetchCfg[0] = prefs.getUChar("pf1", prefetchCfg[0]);
+  prefetchCfg[1] = prefs.getUChar("pf2", prefetchCfg[1]);
+  prefetchCfg[2] = prefs.getUChar("pf3", prefetchCfg[2]);
+  prefetchCfg[3] = prefs.getUChar("pf4", prefetchCfg[3]);
 
- prefs.end();
+  prefs.end();
 
- logf("[NVS] Config cargada:");
- logf(" T_ACK_TO_COMPLETE=%u", T_ACK_TO_COMPLETE);
- logf(" T_COMPLETE_TO_DATA=%u", T_COMPLETE_TO_DATA);
- logf(" T_DATA_TO_CHK=%u", T_DATA_TO_CHK);
- logf(" T_CHUNK_DELAY=%u", T_CHUNK_DELAY);
- logf(" Prefetch D1..D4=%u,%u,%u,%u",
- prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
+  logf("[NVS] Config cargada:");
+  logf(" T_ACK_TO_COMPLETE=%u",  T_ACK_TO_COMPLETE);
+  logf(" T_COMPLETE_TO_DATA=%u", T_COMPLETE_TO_DATA);
+  logf(" T_DATA_TO_CHK=%u",      T_DATA_TO_CHK);
+  logf(" T_CHUNK_DELAY=%u",      T_CHUNK_DELAY);
+  logf(" Prefetch D1..D4=%u,%u,%u,%u",
+       prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
 }
 
 // ========= Web UI Handlers =========
 
-// HTML principal
 void handleRoot(){
- server.send_P(200, "text/html", INDEX_HTML);
+  server.send_P(200, "text/html", INDEX_HTML);
 }
 
-// JSON con estado (drives + timings) — con logs extra
 void handleApiStatus(){
- Serial.println("[WEB] /api/status llamado");
+  Serial.println("[WEB] /api/status llamado");
 
- String json;
- json.reserve(1024);
- json += F("{\"drives\":[");
- unsigned long now = millis();
+  String json;
+  json.reserve(1024);
+  json += F("{\"drives\":[");
+  unsigned long now = millis();
 
- bool first = true;
- for (uint8_t dev = DEV_MIN; dev <= DEV_MAX; dev++){
- int idx = devIndex(dev);
- if (idx < 0) continue;
+  bool first = true;
+  for (uint8_t dev = DEV_MIN; dev <= DEV_MAX; dev++){
+    int idx = devIndex(dev);
+    if (idx < 0) continue;
 
- if (!first) json += ',';
- first = false;
+    if (!first) json += ',';
+    first = false;
 
- json += F("{\"dev\":\"");
- json += devName(dev);
- json += F("\",");
+    json += F("{\"dev\":\"");
+    json += devName(dev);
+    json += F("\",");
 
- json += F("\"present\":");
- json += (slaves[idx].present ? F("true") : F("false"));
- json += F(",");
+    json += F("\"present\":");
+    json += (slaves[idx].present ? F("true") : F("false"));
+    json += F(",");
 
- json += F("\"supports256\":");
- json += (slaves[idx].supports256 ? F("true") : F("false"));
- json += F(",");
+    json += F("\"supports256\":");
+    json += (slaves[idx].supports256 ? F("true") : F("false"));
+    json += F(",");
 
- json += F("\"mac\":\"");
- if (slaves[idx].present){
- json += formatMac(slaves[idx].mac);
- }
- json += F("\",");
+    json += F("\"mac\":\"");
+    if (slaves[idx].present){
+      json += formatMac(slaves[idx].mac);
+    }
+    json += F("\",");
 
- json += F("\"prefetch\":");
- json += (prefetchCfg[idx] > 0 ? F("true") : F("false"));
- json += F(",");
+    json += F("\"prefetch\":");
+    json += (prefetchCfg[idx] > 0 ? F("true") : F("false"));
+    json += F(",");
 
- json += F("\"prefetchSectors\":");
- json += String(prefetchCfg[idx]);
+    json += F("\"prefetchSectors\":");
+    json += String(prefetchCfg[idx]);
 
- json += F(",\"lastSeenMs\":");
- if (slaves[idx].present){
- json += String(now - slaves[idx].lastSeen);
- } else {
- json += F("0");
- }
- json += F("}");
- }
+    json += F(",\"lastSeenMs\":");
+    if (slaves[idx].present){
+      json += String(now - slaves[idx].lastSeen);
+    } else {
+      json += F("0");
+    }
+    json += F("}");
+  }
 
- json += F("],\"timings\":{");
- json += F("\"ackToComplete\":"); json += String(T_ACK_TO_COMPLETE); json += F(",");
- json += F("\"completeToData\":"); json += String(T_COMPLETE_TO_DATA); json += F(",");
- json += F("\"dataToChk\":"); json += String(T_DATA_TO_CHK); json += F(",");
- json += F("\"chunkDelay\":"); json += String(T_CHUNK_DELAY);
- json += F("}}");
+  json += F("],\"timings\":{");
+  json += F("\"ackToComplete\":");  json += String(T_ACK_TO_COMPLETE);  json += F(",");
+  json += F("\"completeToData\":"); json += String(T_COMPLETE_TO_DATA); json += F(",");
+  json += F("\"dataToChk\":");      json += String(T_DATA_TO_CHK);      json += F(",");
+  json += F("\"chunkDelay\":");     json += String(T_CHUNK_DELAY);
+  json += F("}}");
 
- Serial.print("[WEB] /api/status JSON = ");
- Serial.println(json);
+  Serial.print("[WEB] /api/status JSON = ");
+  Serial.println(json);
 
- server.send(200, "application/json", json);
+  server.send(200, "application/json", json);
 }
 
 void handleSetTiming(){
- if (server.hasArg("t_ack")){
- T_ACK_TO_COMPLETE = (uint16_t)server.arg("t_ack").toInt();
- }
- if (server.hasArg("t_comp")){
- T_COMPLETE_TO_DATA = (uint16_t)server.arg("t_comp").toInt();
- }
- if (server.hasArg("t_chk")){
- T_DATA_TO_CHK = (uint16_t)server.arg("t_chk").toInt();
- }
- if (server.hasArg("t_chunk")){
- T_CHUNK_DELAY = (uint16_t)server.arg("t_chunk").toInt();
- }
+  if (server.hasArg("t_ack")){
+    T_ACK_TO_COMPLETE = (uint16_t)server.arg("t_ack").toInt();
+  }
+  if (server.hasArg("t_comp")){
+    T_COMPLETE_TO_DATA = (uint16_t)server.arg("t_comp").toInt();
+  }
+  if (server.hasArg("t_chk")){
+    T_DATA_TO_CHK = (uint16_t)server.arg("t_chk").toInt();
+  }
+  if (server.hasArg("t_chunk")){
+    T_CHUNK_DELAY = (uint16_t)server.arg("t_chunk").toInt();
+  }
 
- logf("[WEB] Tiempos: ACK->COMP=%u, COMP->DATA=%u, DATA->CHK=%u, CHUNK=%u",
- T_ACK_TO_COMPLETE, T_COMPLETE_TO_DATA, T_DATA_TO_CHK, T_CHUNK_DELAY);
+  logf("[WEB] Tiempos: ACK->COMP=%u, COMP->DATA=%u, DATA->CHK=%u, CHUNK=%u",
+       T_ACK_TO_COMPLETE, T_COMPLETE_TO_DATA, T_DATA_TO_CHK, T_CHUNK_DELAY);
 
- // Guardar en NVS
- saveTimingConfigToNvs();
-
- server.send(200, "text/plain", "OK");
+  saveTimingConfigToNvs();
+  server.send(200, "text/plain", "OK");
 }
 
 void handleSetPrefetch(){
- for (int idx = 0; idx < 4; idx++){
- String argName = "pf" + String(idx + 1);
- if (server.hasArg(argName)){
- int v = server.arg(argName).toInt();
- if (v < 0) v = 0;
- if (v > MAX_PREFETCH_SECTORS) v = MAX_PREFETCH_SECTORS;
- prefetchCfg[idx] = (uint8_t)v;
- }
- }
+  for (int idx = 0; idx < 4; idx++){
+    String argName = "pf" + String(idx + 1);
+    if (server.hasArg(argName)){
+      int v = server.arg(argName).toInt();
+      if (v < 0) v = 0;
+      if (v > MAX_PREFETCH_SECTORS) v = MAX_PREFETCH_SECTORS;
+      prefetchCfg[idx] = (uint8_t)v;
+    }
+  }
 
- logf("[WEB] Prefetch: D1=%u, D2=%u, D3=%u, D4=%u",
- prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
+  logf("[WEB] Prefetch: D1=%u, D2=%u, D3=%u, D4=%u",
+       prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
 
- // Guardar en NVS
- savePrefetchConfigToNvs();
-
- server.send(200, "text/plain", "OK");
+  savePrefetchConfigToNvs();
+  server.send(200, "text/plain", "OK");
 }
 
 // ========= Lógica común de recepción/envío ESP-NOW =========
 
 static void handleEspNowRecvCommon(const uint8_t* mac, const uint8_t* data, int len){
- if (!data || len <= 0) return;
- uint8_t type = data[0];
+  if (!data || len <= 0) return;
+  uint8_t type = data[0];
 
- // HELLO: [0]=TYPE_HELLO,[1]=dev,[2]=supports256
- if (type == TYPE_HELLO && len >= 3){
- uint8_t dev = data[1];
- bool s256 = (data[2] != 0);
+  if (type == TYPE_HELLO && len >= 3){
+    uint8_t dev = data[1];
+    bool s256 = (data[2] != 0);
 
- int idx = devIndex(dev);
- if (idx >= 0 && mac){
- slaves[idx].present = true;
- slaves[idx].supports256 = s256;
- memcpy(slaves[idx].mac, mac, 6);
- slaves[idx].lastSeen = millis();
- ensurePeer(slaves[idx].mac);
- logf("[HELLO] %s presente DD=%u MAC=%s",
- devName(dev), s256, formatMac(slaves[idx].mac).c_str());
- }
- return;
- }
+    int idx = devIndex(dev);
+    if (idx >= 0 && mac){
+      slaves[idx].present     = true;
+      slaves[idx].supports256 = s256;
+      memcpy(slaves[idx].mac, mac, 6);
+      slaves[idx].lastSeen = millis();
+      ensurePeer(slaves[idx].mac);
+      logf("[HELLO] %s presente DD=%u MAC=%s",
+           devName(dev), s256, formatMac(slaves[idx].mac).c_str());
+    }
+    return;
+  }
 
- // SECTOR_CHUNK desde SLAVE → MASTER (READ/STATUS/FORMAT)
- // [0]=TYPE_SECTOR_CHUNK,[1]=dev,[2]=secL,[3]=secH,[4]=ci,[5]=cc,[6..]=data
- if (type == TYPE_SECTOR_CHUNK && len >= 6){
- uint8_t dev = data[1];
- uint16_t sec = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
- uint8_t ci = data[4];
- uint8_t cc = data[5];
- int payload = len - 6;
+  if (type == TYPE_SECTOR_CHUNK && len >= 6){
+    uint8_t dev = data[1];
+    uint16_t sec = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
+    uint8_t ci = data[4];
+    uint8_t cc = data[5];
+    int payload = len - 6;
 
- if (dev != currentOpDev || currentOpType == OP_NONE) return;
+    if (dev != currentOpDev || currentOpType == OP_NONE) return;
 
- if (ci == 0){
- memset(replyBuf, 0, sizeof(replyBuf));
- replySec = sec;
- expectedChunks = cc;
- receivedChunks = 0;
- replyLen = 0;
- replyReady = false;
- }
+    if (ci == 0){
+      memset(replyBuf, 0, sizeof(replyBuf));
+      replySec       = sec;
+      expectedChunks = cc;
+      receivedChunks = 0;
+      replyLen       = 0;
+      replyReady     = false;
+    }
 
- int off = ci * CHUNK_PAYLOAD;
- int copyLen = payload;
- if (off + copyLen > MAX_SECTOR_BYTES)
- copyLen = MAX_SECTOR_BYTES - off;
+    int off = ci * CHUNK_PAYLOAD;
+    int copyLen = payload;
+    if (off + copyLen > MAX_SECTOR_BYTES)
+      copyLen = MAX_SECTOR_BYTES - off;
 
- if (copyLen > 0){
- memcpy(replyBuf + off, data + 6, copyLen);
- replyLen += copyLen;
- }
+    if (copyLen > 0){
+      memcpy(replyBuf + off, data + 6, copyLen);
+      replyLen += copyLen;
+    }
 
- receivedChunks++;
- logf("[NET] TYPE_SECTOR_CHUNK dev=%s sec=%u ci=%u/%u payload=%d",
- devName(dev), sec, ci, cc, payload);
+    receivedChunks++;
+    logf("[NET] TYPE_SECTOR_CHUNK dev=%s sec=%u ci=%u/%u payload=%d",
+         devName(dev), sec, ci, cc, payload);
 
- if (receivedChunks >= expectedChunks){
- replyReady = true;
- logf("[NET] Respuesta completa dev=%s sec=%u len=%u",
- devName(dev), sec, replyLen);
- }
- return;
- }
+    if (receivedChunks >= expectedChunks){
+      replyReady = true;
+      logf("[NET] Respuesta completa dev=%s sec=%u len=%u",
+           devName(dev), sec, replyLen);
+    }
+    return;
+  }
 
- if (type == TYPE_ACK){
- logf("[ESPNOW] ACK recibido");
- lastAckOk = true;
- lastAckDone = true;
- return;
- } else if (type == TYPE_NAK){
- logf("[ESPNOW] NAK recibido");
- lastAckOk = false;
- lastAckDone = true;
- return;
- }
+  if (type == TYPE_ACK){
+    logf("[ESPNOW] ACK recibido");
+    lastAckOk   = true;
+    lastAckDone = true;
+    return;
+  } else if (type == TYPE_NAK){
+    logf("[ESPNOW] NAK recibido");
+    lastAckOk   = false;
+    lastAckDone = true;
+    return;
+  }
 }
 
 static void handleEspNowSentCommon(esp_now_send_status_t status){
- if (status == ESP_NOW_SEND_SUCCESS)
- Serial.println("[ESPNOW] Envío OK");
- else
- Serial.println("[ESPNOW] Falla en envío");
+  if (status == ESP_NOW_SEND_SUCCESS)
+    Serial.println("[ESPNOW] Envío OK");
+  else
+    Serial.println("[ESPNOW] Falla en envío");
 }
-
-// ========= Callbacks ESP-NOW dependientes de versión =========
 
 #if ESP_IDF_VERSION_MAJOR >= 5
 
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len){
- const uint8_t *mac = info ? info->src_addr : nullptr;
- handleEspNowRecvCommon(mac, data, len);
+  const uint8_t *mac = info ? info->src_addr : nullptr;
+  handleEspNowRecvCommon(mac, data, len);
 }
 
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status){
- (void)info;
- handleEspNowSentCommon(status);
+  (void)info;
+  handleEspNowSentCommon(status);
 }
 
-#else // IDF < 5
+#else
 
 void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
- handleEspNowRecvCommon(mac, data, len);
+  handleEspNowRecvCommon(mac, data, len);
 }
 
 void onDataSent(const uint8_t* mac, esp_now_send_status_t status){
- (void)mac;
- handleEspNowSentCommon(status);
+  (void)mac;
+  handleEspNowSentCommon(status);
 }
 
 #endif
@@ -866,557 +854,707 @@ void onDataSent(const uint8_t* mac, esp_now_send_status_t status){
 
 // [0]=TYPE_CMD_FRAME,[1]=cmd,[2]=dev,[3]=secL,[4]=secH,[5]=dens,[6]=prefetchCount
 bool sendCmd(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd){
- uint8_t p[7];
- p[0] = TYPE_CMD_FRAME;
- p[1] = cmd;
- p[2] = dev;
- p[3] = (uint8_t)(sec & 0xFF);
- p[4] = (uint8_t)(sec >> 8);
- p[5] = dd ? 1 : 0;
- uint8_t pf = prefetchForDev(dev);
- if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
- p[6] = pf;
+  uint8_t p[7];
+  p[0] = TYPE_CMD_FRAME;
+  p[1] = cmd;
+  p[2] = dev;
+  p[3] = (uint8_t)(sec & 0xFF);
+  p[4] = (uint8_t)(sec >> 8);
+  p[5] = dd ? 1 : 0;
+  uint8_t pf = prefetchForDev(dev);
+  if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
+  p[6] = pf;
 
- const uint8_t* dest = macForDev(dev);
+  const uint8_t* dest = macForDev(dev);
 
- logf("[ESPNOW][TX] CMD_FRAME dev=%s cmd=0x%02X sec=%u dd=%s pf=%u",
- devName(dev), cmd, sec, dd ? "DD" : "SD", pf);
- logHex("[ESPNOW][TX] bytes:", p, sizeof(p));
+  logf("[ESPNOW][TX] CMD_FRAME dev=%s cmd=0x%02X sec=%u dd=%s pf=%u",
+       devName(dev), cmd, sec, dd ? "DD" : "SD", pf);
+  logHex("[ESPNOW][TX] bytes:", p, sizeof(p));
 
- esp_err_t e = esp_now_send(dest, p, sizeof(p));
- if (e != ESP_OK){
- logf("[ESPNOW] esp_now_send error=%d", (int)e);
- }
- return (e == ESP_OK);
+  esp_err_t e = esp_now_send(dest, p, sizeof(p));
+  if (e != ESP_OK){
+    logf("[ESPNOW] esp_now_send error=%d", (int)e);
+  }
+  return (e == ESP_OK);
 }
 
-// Envío de datos de sector MASTER → SLAVE (WRITE)
 void sendWriteDataToSlave(uint8_t dev, uint16_t sec, const uint8_t* buf, int len){
- uint8_t pkt[6 + CHUNK_PAYLOAD];
- int cc = (len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
- const uint8_t* dest = macForDev(dev);
+  uint8_t pkt[6 + CHUNK_PAYLOAD];
+  int cc = (len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+  const uint8_t* dest = macForDev(dev);
 
- for (int i = 0; i < cc; i++){
- int off = i * CHUNK_PAYLOAD;
- int n = (len - off > CHUNK_PAYLOAD) ? CHUNK_PAYLOAD : (len - off);
+  for (int i = 0; i < cc; i++){
+    int off = i * CHUNK_PAYLOAD;
+    int n = (len - off > CHUNK_PAYLOAD) ? CHUNK_PAYLOAD : (len - off);
 
- pkt[0] = TYPE_SECTOR_CHUNK;
- pkt[1] = dev;
- pkt[2] = (uint8_t)(sec & 0xFF);
- pkt[3] = (uint8_t)(sec >> 8);
- pkt[4] = (uint8_t)i; // chunk index
- pkt[5] = (uint8_t)cc; // chunk count
- memcpy(pkt + 6, buf + off, n);
+    pkt[0] = TYPE_SECTOR_CHUNK;
+    pkt[1] = dev;
+    pkt[2] = (uint8_t)(sec & 0xFF);
+    pkt[3] = (uint8_t)(sec >> 8);
+    pkt[4] = (uint8_t)i;
+    pkt[5] = (uint8_t)cc;
+    memcpy(pkt + 6, buf + off, n);
 
- logf("[ESPNOW][TX] WRITE_CHUNK dev=%s sec=%u ci=%d/%d len=%d",
- devName(dev), sec, i, cc, n);
- esp_err_t e = esp_now_send(dest, pkt, 6 + n);
- if (e != ESP_OK){
- logf("[ESPNOW] WRITE esp_now_send error=%d", (int)e);
- }
- delay(2);
- }
+    logf("[ESPNOW][TX] WRITE_CHUNK dev=%s sec=%u ci=%d/%d len=%d",
+         devName(dev), sec, i, cc, n);
+    esp_err_t e = esp_now_send(dest, pkt, 6 + n);
+    if (e != ESP_OK){
+      logf("[ESPNOW] WRITE esp_now_send error=%d", (int)e);
+    }
+    delay(2);
+  }
 }
 
-// Lee sector remoto (128/256) para dev dado
 int readRemoteSector(uint8_t dev, uint16_t sec, bool dd, uint8_t* out){
- int idx = devIndex(dev);
- if (idx < 0 || !slaves[idx].present){
- logf("[READ] %s no presente", devName(dev));
- return 0;
- }
+  int idx = devIndex(dev);
+  if (idx < 0 || !slaves[idx].present){
+    logf("[READ] %s no presente", devName(dev));
+    return 0;
+  }
 
- replyReady = false;
- replySec = 0;
- replyLen = 0;
- expectedChunks = receivedChunks = 0;
+  replyReady = false;
+  replySec   = 0;
+  replyLen   = 0;
+  expectedChunks = receivedChunks = 0;
 
- currentOpType = OP_READ;
- currentOpDev = dev;
- currentOpSec = sec;
+  currentOpType = OP_READ;
+  currentOpDev  = dev;
+  currentOpSec  = sec;
 
- logf("[READ] Solicitando sec=%u dd=%s a %s",
- sec, dd ? "DD" : "SD", devName(dev));
+  logf("[READ] Solicitando sec=%u dd=%s a %s",
+       sec, dd ? "DD" : "SD", devName(dev));
 
- if (!sendCmd(dev, 0x52, sec, dd)){
- logf("[READ] sendCmd falló para %s", devName(dev));
- currentOpType = OP_NONE;
- return 0;
- }
+  if (!sendCmd(dev, 0x52, sec, dd)){
+    logf("[READ] sendCmd falló para %s", devName(dev));
+    currentOpType = OP_NONE;
+    return 0;
+  }
 
- unsigned long t0 = millis();
- int expectedLen = dd ? SECTOR_256 : SECTOR_128;
+  unsigned long t0 = millis();
+  int expectedLen = dd ? SECTOR_256 : SECTOR_128;
 
- while (millis() - t0 < 8000){
- if (replyReady && replySec == sec) break;
- delay(2);
- }
+  while (millis() - t0 < 8000){
+    if (replyReady && replySec == sec) break;
+    delay(2);
+  }
 
- currentOpType = OP_NONE;
+  currentOpType = OP_NONE;
 
- if (!(replyReady && replySec == sec)){
- logf("[READ] Timeout esperando sec=%u de %s", sec, devName(dev));
- return 0;
- }
+  if (!(replyReady && replySec == sec)){
+    logf("[READ] Timeout esperando sec=%u de %s", sec, devName(dev));
+    return 0;
+  }
 
- int n = (replyLen > expectedLen) ? expectedLen : replyLen;
- memcpy(out, replyBuf, n);
+  int n = (replyLen > expectedLen) ? expectedLen : replyLen;
+  memcpy(out, replyBuf, n);
 
- logf("[READ] OK %s sec=%u len=%d", devName(dev), sec, n);
- logHex("[READ] Primeros bytes:", out, n);
+  logf("[READ] OK %s sec=%u len=%d", devName(dev), sec, n);
+  logHex("[READ] Primeros bytes:", out, n);
 
- return n;
+  return n;
 }
 
-// Lee STATUS remoto (4 bytes) para dev dado
 int readRemoteStatus(uint8_t dev, bool dd, uint8_t* out4){
- (void)dd; // no usamos densidad para STATUS de momento
+  (void)dd;
 
- int idx = devIndex(dev);
- if (idx < 0 || !slaves[idx].present){
- logf("[STATUS] %s no presente", devName(dev));
- return 0;
- }
+  int idx = devIndex(dev);
+  if (idx < 0 || !slaves[idx].present){
+    logf("[STATUS] %s no presente", devName(dev));
+    return 0;
+  }
 
- replyReady = false;
- replySec = 0;
- replyLen = 0;
- expectedChunks = receivedChunks = 0;
+  replyReady = false;
+  replySec   = 0;
+  replyLen   = 0;
+  expectedChunks = receivedChunks = 0;
 
- currentOpType = OP_STATUS;
- currentOpDev = dev;
- currentOpSec = 0;
+  currentOpType = OP_STATUS;
+  currentOpDev  = dev;
+  currentOpSec  = 0;
 
- logf("[STATUS] Solicitando STATUS a %s", devName(dev));
+  logf("[STATUS] Solicitando STATUS a %s", devName(dev));
 
- if (!sendCmd(dev, 0x53, 0, false)){
- logf("[STATUS] sendCmd falló para %s", devName(dev));
- currentOpType = OP_NONE;
- return 0;
- }
+  if (!sendCmd(dev, 0x53, 0, false)){
+    logf("[STATUS] sendCmd falló para %s", devName(dev));
+    currentOpType = OP_NONE;
+    return 0;
+  }
 
- unsigned long t0 = millis();
- while (millis() - t0 < 5000){
- if (replyReady) break;
- delay(2);
- }
+  unsigned long t0 = millis();
+  while (millis() - t0 < 5000){
+    if (replyReady) break;
+    delay(2);
+  }
 
- currentOpType = OP_NONE;
+  currentOpType = OP_NONE;
 
- if (!replyReady){
- logf("[STATUS] Timeout esperando STATUS de %s", devName(dev));
- return 0;
- }
+  if (!replyReady){
+    logf("[STATUS] Timeout esperando STATUS de %s", devName(dev));
+    return 0;
+  }
 
- if (replyLen < 4){
- logf("[STATUS] Respuesta corta (%u bytes) de %s", replyLen, devName(dev));
- return 0;
- }
+  if (replyLen < 4){
+    logf("[STATUS] Respuesta corta (%u bytes) de %s", replyLen, devName(dev));
+    return 0;
+  }
 
- memcpy(out4, replyBuf, 4);
- logHex("[STATUS] bytes:", out4, 4);
- return 4;
+  memcpy(out4, replyBuf, 4);
+  logHex("[STATUS] bytes:", out4, 4);
+  return 4;
 }
 
-// FORMAT remoto (0x21) – 128 bytes de resultado
-int formatRemoteDisk(uint8_t dev, uint16_t param, bool dd, uint8_t* out128){
- int idx = devIndex(dev);
- if (idx < 0 || !slaves[idx].present){
- logf("[FORMAT] %s no presente", devName(dev));
- return 0;
- }
+// FORMAT genérico (0x21 / 0x22) – siempre 128 bytes de resultado
+int formatRemoteDisk(uint8_t dev, uint8_t cmd, uint16_t param, bool dd, uint8_t* out128){
+  (void)dd; // el resultado es siempre 128 bytes, independiente de densidad
 
- replyReady = false;
- replySec = 0;
- replyLen = 0;
- expectedChunks = receivedChunks = 0;
+  int idx = devIndex(dev);
+  if (idx < 0 || !slaves[idx].present){
+    logf("[FORMAT] %s no presente", devName(dev));
+    return 0;
+  }
 
- currentOpType = OP_FORMAT;
- currentOpDev = dev;
- currentOpSec = param;
+  replyReady = false;
+  replySec   = 0;
+  replyLen   = 0;
+  expectedChunks = receivedChunks = 0;
 
- logf("[FORMAT] Solicitando FORMAT a %s param=%u dd=%s",
- devName(dev), param, dd ? "DD" : "SD");
+  currentOpType = OP_FORMAT;
+  currentOpDev  = dev;
+  currentOpSec  = param;
 
- if (!sendCmd(dev, 0x21, param, dd)){
- logf("[FORMAT] sendCmd falló para %s", devName(dev));
- currentOpType = OP_NONE;
- return 0;
- }
+  logf("[FORMAT] Solicitando cmd=0x%02X a %s param=%u",
+       cmd, devName(dev), param);
 
- unsigned long t0 = millis();
- while (millis() - t0 < 90000){
- if (replyReady) break;
- delay(5);
- }
+  if (!sendCmd(dev, cmd, param, false)){
+    logf("[FORMAT] sendCmd 0x%02X falló para %s", cmd, devName(dev));
+    currentOpType = OP_NONE;
+    return 0;
+  }
 
- currentOpType = OP_NONE;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 90000){
+    if (replyReady) break;
+    delay(5);
+  }
 
- if (!replyReady){
- logf("[FORMAT] Timeout esperando resultado FORMAT de %s", devName(dev));
- return 0;
- }
+  currentOpType = OP_NONE;
 
- if (replyLen < SECTOR_128){
- logf("[FORMAT] Respuesta corta (%u bytes) de %s", replyLen, devName(dev));
- }
+  if (!replyReady){
+    logf("[FORMAT] Timeout esperando resultado FORMAT (cmd=0x%02X) de %s",
+         cmd, devName(dev));
+    return 0;
+  }
 
- int n = (replyLen > SECTOR_128) ? SECTOR_128 : replyLen;
- memcpy(out128, replyBuf, n);
- logHex("[FORMAT] bytes:", out128, n);
- return n;
+  if (replyLen < SECTOR_128){
+    logf("[FORMAT] Respuesta corta (%u bytes) de %s", replyLen, devName(dev));
+  }
+
+  int n = (replyLen > SECTOR_128) ? SECTOR_128 : replyLen;
+  memcpy(out128, replyBuf, n);
+  logHex("[FORMAT] bytes:", out128, n);
+  return n;
+}
+
+// Helper específico para 0x22 (por claridad)
+int formatMediumRemoteDisk(uint8_t dev, uint16_t param, uint8_t* out128){
+  return formatRemoteDisk(dev, 0x22, param, false, out128);
+}
+
+// === READ PERCOM BLOCK remoto (0x4E) – 12 bytes ===
+int readRemotePercomBlock(uint8_t dev, uint8_t* out12){
+  int idx = devIndex(dev);
+  if (idx < 0 || !slaves[idx].present){
+    logf("[PERCOM] %s no presente", devName(dev));
+    return 0;
+  }
+
+  replyReady = false;
+  replySec   = 0;
+  replyLen   = 0;
+  expectedChunks = receivedChunks = 0;
+
+  currentOpType = OP_PERCOM;
+  currentOpDev  = dev;
+  currentOpSec  = 0;
+
+  logf("[PERCOM] Solicitando READ PERCOM (0x4E) a %s", devName(dev));
+
+  if (!sendCmd(dev, 0x4E, 0, false)){
+    logf("[PERCOM] sendCmd 0x4E falló para %s", devName(dev));
+    currentOpType = OP_NONE;
+    return 0;
+  }
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 5000){
+    if (replyReady) break;
+    delay(2);
+  }
+
+  currentOpType = OP_NONE;
+
+  if (!replyReady){
+    logf("[PERCOM] Timeout esperando READ PERCOM de %s", devName(dev));
+    return 0;
+  }
+
+  if (replyLen < PERCOM_BLOCK_LEN){
+    logf("[PERCOM] Respuesta corta (%u bytes) de %s", replyLen, devName(dev));
+    return 0;
+  }
+
+  memcpy(out12, replyBuf, PERCOM_BLOCK_LEN);
+  logHex("[PERCOM] READ bytes:", out12, PERCOM_BLOCK_LEN);
+  return PERCOM_BLOCK_LEN;
+}
+
+// === WRITE PERCOM BLOCK remoto (0x4F) – 12 bytes ===
+bool writeRemotePercomBlock(uint8_t dev, const uint8_t* data, int len){
+  int idx = devIndex(dev);
+  if (idx < 0 || !slaves[idx].present){
+    logf("[PERCOM] %s no presente", devName(dev));
+    return false;
+  }
+
+  if (len <= 0){
+    logf("[PERCOM] len inválido=%d para %s", len, devName(dev));
+    return false;
+  }
+
+  uint8_t tmp[PERCOM_BLOCK_LEN];
+  memset(tmp, 0, sizeof(tmp));
+  int copyLen = (len > PERCOM_BLOCK_LEN) ? PERCOM_BLOCK_LEN : len;
+  memcpy(tmp, data, copyLen);
+
+  logf("[PERCOM] Enviando WRITE PERCOM a SLAVE %s len=%d", devName(dev), PERCOM_BLOCK_LEN);
+
+  const uint16_t PERCOM_SEC_MAGIC = 0xFFFF;
+  sendWriteDataToSlave(dev, PERCOM_SEC_MAGIC, tmp, PERCOM_BLOCK_LEN);
+
+  lastAckDone = false;
+  lastAckOk   = false;
+
+  if (!sendCmd(dev, 0x4F, 0, false)){
+    logf("[PERCOM] sendCmd 0x4F falló para %s", devName(dev));
+    return false;
+  }
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 15000){
+    if (lastAckDone) break;
+    delay(5);
+  }
+
+  if (!lastAckDone){
+    logf("[PERCOM] Timeout esperando ACK desde SLAVE %s", devName(dev));
+    return false;
+  }
+
+  if (!lastAckOk){
+    logf("[PERCOM] SLAVE NAK %s", devName(dev));
+    return false;
+  }
+
+  logf("[PERCOM] WRITE OK remoto %s", devName(dev));
+  return true;
 }
 
 // WRITE remoto – sector completo (128/256) + ACK/NAK
 bool writeRemoteSector(uint8_t dev, uint16_t sec, bool dd, const uint8_t* data, int len, bool verify){
- (void)verify; // por ahora no diferenciamos WRITE vs WRITE+VERIFY en lógica interna
+  int idx = devIndex(dev);
+  if (idx < 0 || !slaves[idx].present){
+    logf("[WRITE] %s no presente", devName(dev));
+    return false;
+  }
 
- int idx = devIndex(dev);
- if (idx < 0 || !slaves[idx].present){
- logf("[WRITE] %s no presente", devName(dev));
- return false;
- }
+  if (len <= 0){
+    logf("[WRITE] len inválido=%d para %s sec=%u", len, devName(dev), sec);
+    return false;
+  }
 
- if (len <= 0){
- logf("[WRITE] len inválido=%d para %s sec=%u", len, devName(dev), sec);
- return false;
- }
+  logf("[WRITE] Enviando datos a SLAVE %s sec=%u dd=%s len=%d",
+       devName(dev), sec, dd ? "DD" : "SD", len);
 
- logf("[WRITE] Enviando datos a SLAVE %s sec=%u dd=%s len=%d",
- devName(dev), sec, dd ? "DD" : "SD", len);
+  sendWriteDataToSlave(dev, sec, data, len);
 
- sendWriteDataToSlave(dev, sec, data, len);
+  lastAckDone = false;
+  lastAckOk   = false;
 
- lastAckDone = false;
- lastAckOk = false;
+  uint8_t baseCmd = verify ? 0x57 : 0x50;
 
- uint8_t baseCmd = verify ? 0x57 : 0x50;
+  if (!sendCmd(dev, baseCmd, sec, dd)){
+    logf("[WRITE] sendCmd falló para %s", devName(dev));
+    return false;
+  }
 
- if (!sendCmd(dev, baseCmd, sec, dd)){
- logf("[WRITE] sendCmd falló para %s", devName(dev));
- return false;
- }
+  unsigned long t0 = millis();
+  while (millis() - t0 < 15000){
+    if (lastAckDone) break;
+    delay(5);
+  }
 
- unsigned long t0 = millis();
- while (millis() - t0 < 15000){
- if (lastAckDone) break;
- delay(5);
- }
+  if (!lastAckDone){
+    logf("[WRITE] Timeout esperando ACK desde SLAVE %s sec=%u", devName(dev), sec);
+    return false;
+  }
 
- if (!lastAckDone){
- logf("[WRITE] Timeout esperando ACK desde SLAVE %s sec=%u", devName(dev), sec);
- return false;
- }
+  if (!lastAckOk){
+    logf("[WRITE] SLAVE NAK %s sec=%u", devName(dev), sec);
+    return false;
+  }
 
- if (!lastAckOk){
- logf("[WRITE] SLAVE NAK %s sec=%u", devName(dev), sec);
- return false;
- }
-
- logf("[WRITE] OK remoto %s sec=%u", devName(dev), sec);
- return true;
+  logf("[WRITE] OK remoto %s sec=%u", devName(dev), sec);
+  return true;
 }
 
 // ========= SIO: envío de DATA+CHK al Atari =========
 
 void sendAtariData(const uint8_t* buf, int len){
- delayMicroseconds(T_ACK_TO_COMPLETE);
- SerialSIO.write(SIO_COMPLETE);
- SerialSIO.flush();
- logf("[TX->Atari] COMPLETE");
+  delayMicroseconds(T_ACK_TO_COMPLETE);
+  SerialSIO.write(SIO_COMPLETE);
+  SerialSIO.flush();
+  logf("[TX->Atari] COMPLETE");
 
- delayMicroseconds(T_COMPLETE_TO_DATA);
- SerialSIO.write(buf, len);
- SerialSIO.flush();
- logf("[TX->Atari] DATA len=%d", len);
- logHex("[TX->Atari] DATA bytes:", buf, len);
+  delayMicroseconds(T_COMPLETE_TO_DATA);
+  SerialSIO.write(buf, len);
+  SerialSIO.flush();
+  logf("[TX->Atari] DATA len=%d", len);
+  logHex("[TX->Atari] DATA bytes:", buf, len);
 
- delayMicroseconds(T_DATA_TO_CHK);
- uint8_t chk = sioChecksum(buf, len);
- SerialSIO.write(chk);
- SerialSIO.flush();
- logf("[TX->Atari] CHK=%02X", chk);
+  delayMicroseconds(T_DATA_TO_CHK);
+  uint8_t chk = sioChecksum(buf, len);
+  SerialSIO.write(chk);
+  SerialSIO.flush();
+  logf("[TX->Atari] CHK=%02X", chk);
 
- delayMicroseconds(T_CHUNK_DELAY);
+  delayMicroseconds(T_CHUNK_DELAY);
 }
 
-// Envío sólo COMPLETE/ERROR al Atari (para WRITE)
+// Envío sólo COMPLETE/ERROR al Atari (para WRITE/PERCOM 4F)
 void sendAtariComplete(bool ok){
- if (ok){
- delayMicroseconds(T_ACK_TO_COMPLETE);
- SerialSIO.write(SIO_COMPLETE);
- SerialSIO.flush();
- logf("[TX->Atari] COMPLETE (WRITE)");
- } else {
- SerialSIO.write(SIO_ERROR);
- SerialSIO.flush();
- logf("[TX->Atari] ERROR (WRITE)");
- }
- delayMicroseconds(T_CHUNK_DELAY);
+  if (ok){
+    delayMicroseconds(T_ACK_TO_COMPLETE);
+    SerialSIO.write(SIO_COMPLETE);
+    SerialSIO.flush();
+    logf("[TX->Atari] COMPLETE (WRITE/PERCOM)");
+  } else {
+    SerialSIO.write(SIO_ERROR);
+    SerialSIO.flush();
+    logf("[TX->Atari] ERROR (WRITE/PERCOM)");
+  }
+  delayMicroseconds(T_CHUNK_DELAY);
 }
 
-// Lee DATA+CHK desde el Atari para un WRITE
-bool readAtariWriteData(uint8_t* buf, int len){
- int idx = 0;
- unsigned long t0 = millis();
- while (idx < len && (millis() - t0) < 1000){
- if (SerialSIO.available()){
- buf[idx++] = SerialSIO.read();
- } else {
- delay(1);
- }
- }
+// Lee DATA+CHK desde el Atari (WRITE 128/256 o PERCOM 12)
+bool readAtariWriteData(uint8_t* buf, int len, bool strictChk){
+  int idx = 0;
+  unsigned long t0 = millis();
+  while (idx < len && (millis() - t0) < 1000){
+    if (SerialSIO.available()){
+      buf[idx++] = SerialSIO.read();
+    } else {
+      delay(1);
+    }
+  }
 
- if (idx != len){
- logf("[SIO] WRITE: esperados %d bytes, recibidos %d", len, idx);
- return false;
- }
+  if (idx != len){
+    logf("[SIO] WRITE: esperados %d bytes, recibidos %d", len, idx);
+    if (strictChk) return false;
+  }
 
- // Leer checksum
- uint8_t recvChk = 0;
- bool gotChk = false;
- unsigned long t1 = millis();
- while ((millis() - t1) < 200){
- if (SerialSIO.available()){
- recvChk = SerialSIO.read();
- gotChk = true;
- break;
- }
- delay(1);
- }
+  uint8_t recvChk = 0;
+  bool gotChk = false;
+  unsigned long t1 = millis();
+  while ((millis() - t1) < 200){
+    if (SerialSIO.available()){
+      recvChk = SerialSIO.read();
+      gotChk = true;
+      break;
+    }
+    delay(1);
+  }
 
- if (!gotChk){
- logf("[SIO] WRITE: checksum no recibido");
- return false;
- }
+  if (!gotChk){
+    logf("[SIO] WRITE: checksum no recibido");
+    if (strictChk) return false;
+  } else {
+    uint8_t calcChk = sioChecksum(buf, len);
+    if (recvChk != calcChk){
+      logf("[SIO] WRITE: checksum inválido recv=%02X calc=%02X", recvChk, calcChk);
+      if (strictChk) return false;
+    }
+  }
 
- uint8_t calcChk = sioChecksum(buf, len);
- if (recvChk != calcChk){
- logf("[SIO] WRITE: checksum inválido recv=%02X calc=%02X", recvChk, calcChk);
- return false;
- }
-
- logHex("[SIO] WRITE DATA:", buf, len);
- return true;
+  logHex("[SIO] WRITE DATA:", buf, len);
+  return true;
 }
 
 // ========= Procesar cabecera SIO del Atari =========
 
 void handleSioHeader(uint8_t f[5]){
- uint8_t dev = f[0];
- uint8_t cmd = f[1];
- uint8_t aux1 = f[2];
- uint8_t aux2 = f[3];
- uint8_t recvChk= f[4];
+  uint8_t dev     = f[0];
+  uint8_t cmd     = f[1];
+  uint8_t aux1    = f[2];
+  uint8_t aux2    = f[3];
+  uint8_t recvChk = f[4];
 
- uint8_t calcChk = sioChecksum(f, 4);
+  logf("[HDR] %02X %02X %02X %02X %02X", f[0], f[1], f[2], f[3], f[4]);
 
- logf("[HDR] %02X %02X %02X %02X %02X", f[0], f[1], f[2], f[3], f[4]);
+  if (dev < DEV_MIN || dev > DEV_MAX){
+    logf("[SIO] Header hacia dev=%02X (fuera de rango), ignorado", dev);
+    return;
+  }
 
- if (recvChk != calcChk){
- delayMicroseconds(800);
- SerialSIO.write(SIO_NAK);
- SerialSIO.flush();
- logf("[SIO] Checksum inválido (recv=%02X calc=%02X)", recvChk, calcChk);
- return;
- }
+  uint8_t calcChk = sioChecksum(f, 4);
+  if (recvChk != calcChk){
+    logf("[SIO] Checksum inválido (recv=%02X calc=%02X) para %s -> ignorado",
+         recvChk, calcChk, devName(dev));
+    return;
+  }
 
- if (dev < DEV_MIN || dev > DEV_MAX){
- return;
- }
+  bool dd      = (cmd & 0x80) != 0;
+  uint8_t base = cmd & 0x7F;
+  uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
 
- bool dd = (cmd & 0x80) != 0;
- uint8_t base = cmd & 0x7F;
- uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
+  // READ SECTOR
+  if (base == 0x52){
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (READ) %s sec=%u", devName(dev), sec);
+    delayMicroseconds(800);
 
- // READ SECTOR
- if (base == 0x52){
- SerialSIO.write(SIO_ACK);
- SerialSIO.flush();
- logf("[TX->Atari] ACK (READ) %s sec=%u", devName(dev), sec);
- delayMicroseconds(800);
+    uint8_t buf[MAX_SECTOR_BYTES];
+    int n = readRemoteSector(dev, sec, dd, buf);
+    if (n <= 0){
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      logf("[SIO] READ remoto falló %s sec=%u", devName(dev), sec);
+      return;
+    }
 
- uint8_t buf[MAX_SECTOR_BYTES];
- int n = readRemoteSector(dev, sec, dd, buf);
- if (n <= 0){
- SerialSIO.write(SIO_ERROR);
- SerialSIO.flush();
- logf("[SIO] READ remoto falló %s sec=%u", devName(dev), sec);
- return;
- }
+    sendAtariData(buf, n);
+    return;
+  }
 
- sendAtariData(buf, n);
- return;
- }
+  // STATUS
+  if (base == 0x53){
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (STATUS) %s", devName(dev));
+    delayMicroseconds(800);
 
- // STATUS
- if (base == 0x53){
- SerialSIO.write(SIO_ACK);
- SerialSIO.flush();
- logf("[TX->Atari] ACK (STATUS) %s", devName(dev));
- delayMicroseconds(800);
+    uint8_t st[4];
+    int n = readRemoteStatus(dev, dd, st);
+    if (n != 4){
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      logf("[SIO] STATUS remoto falló %s", devName(dev));
+      return;
+    }
 
- uint8_t st[4];
- int n = readRemoteStatus(dev, dd, st);
- if (n != 4){
- SerialSIO.write(SIO_ERROR);
- SerialSIO.flush();
- logf("[SIO] STATUS remoto falló %s", devName(dev));
- return;
- }
+    sendAtariData(st, 4);
+    return;
+  }
 
- sendAtariData(st, 4);
- return;
- }
+  // FORMAT INDEX (0x21)
+  if (base == 0x21){
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (FORMAT 0x21) %s aux=%u", devName(dev), sec);
+    delayMicroseconds(800);
 
- // FORMAT (0x21)
- if (base == 0x21){
- SerialSIO.write(SIO_ACK);
- SerialSIO.flush();
- logf("[TX->Atari] ACK (FORMAT) %s aux=%u", devName(dev), sec);
- delayMicroseconds(800);
+    uint8_t fmt[SECTOR_128];
+    int n = formatRemoteDisk(dev, 0x21, sec, dd, fmt);
+    if (n <= 0){
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      logf("[SIO] FORMAT 0x21 remoto falló %s aux=%u", devName(dev), sec);
+      return;
+    }
 
- uint8_t fmt[SECTOR_128];
- int n = formatRemoteDisk(dev, sec, dd, fmt);
- if (n <= 0){
- SerialSIO.write(SIO_ERROR);
- SerialSIO.flush();
- logf("[SIO] FORMAT remoto falló %s aux=%u", devName(dev), sec);
- return;
- }
+    sendAtariData(fmt, n);
+    return;
+  }
 
- sendAtariData(fmt, n);
- return;
- }
+  // FORMAT MEDIUM / ENHANCED (0x22)
+  if (base == 0x22){
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (FORMAT MEDIUM 0x22) %s aux=%u", devName(dev), sec);
+    delayMicroseconds(800);
 
- // WRITE SECTOR (0x50 / 0x57)
- if (base == 0x50 || base == 0x57){
- bool verify = (base == 0x57);
+    uint8_t fmt[SECTOR_128];
+    int n = formatMediumRemoteDisk(dev, sec, fmt);
+    if (n <= 0){
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      logf("[SIO] FORMAT MEDIUM remoto falló %s aux=%u", devName(dev), sec);
+      return;
+    }
 
- SerialSIO.write(SIO_ACK);
- SerialSIO.flush();
- logf("[TX->Atari] ACK (WRITE%s) %s sec=%u",
- verify ? "+VERIFY" : "", devName(dev), sec);
- delayMicroseconds(800);
+    sendAtariData(fmt, n);
+    return;
+  }
 
- uint8_t buf[MAX_SECTOR_BYTES];
- int expectedLen = dd ? SECTOR_256 : SECTOR_128;
+  // READ PERCOM BLOCK (0x4E) – 12 bytes
+  if (base == 0x4E){
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (READ PERCOM 0x4E) %s", devName(dev));
+    delayMicroseconds(800);
 
- if (!readAtariWriteData(buf, expectedLen)){
- logf("[SIO] Fallo leyendo DATA WRITE desde Atari %s sec=%u", devName(dev), sec);
- sendAtariComplete(false);
- return;
- }
+    uint8_t blk[PERCOM_BLOCK_LEN];
+    int n = readRemotePercomBlock(dev, blk);
+    if (n != PERCOM_BLOCK_LEN){
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      logf("[SIO] PERCOM READ remoto falló %s", devName(dev));
+      return;
+    }
 
- bool ok = writeRemoteSector(dev, sec, dd, buf, expectedLen, verify);
- sendAtariComplete(ok);
- return;
- }
+    sendAtariData(blk, PERCOM_BLOCK_LEN);
+    return;
+  }
 
- // Otros comandos no soportados
- delayMicroseconds(800);
- SerialSIO.write(SIO_NAK);
- SerialSIO.flush();
- logf("[SIO] Cmd no soportado 0x%02X para %s => NAK", base, devName(dev));
+  // WRITE PERCOM BLOCK (0x4F) – 12 bytes
+  if (base == 0x4F){
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (WRITE PERCOM 0x4F) %s", devName(dev));
+    delayMicroseconds(800);
+
+    uint8_t blk[PERCOM_BLOCK_LEN];
+    if (!readAtariWriteData(blk, PERCOM_BLOCK_LEN, true)){
+      logf("[SIO] Fallo leyendo DATA PERCOM (12 bytes) desde Atari %s", devName(dev));
+      sendAtariComplete(false);
+      return;
+    }
+
+    bool ok = writeRemotePercomBlock(dev, blk, PERCOM_BLOCK_LEN);
+    sendAtariComplete(ok);
+    return;
+  }
+
+  // WRITE SECTOR (0x50 / 0x57)
+  if (base == 0x50 || base == 0x57){
+    bool verify = (base == 0x57);
+
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    logf("[TX->Atari] ACK (WRITE%s) %s sec=%u",
+         verify ? "+VERIFY" : "", devName(dev), sec);
+    delayMicroseconds(800);
+
+    uint8_t buf[MAX_SECTOR_BYTES];
+    int expectedLen = dd ? SECTOR_256 : SECTOR_128;
+
+    // 0x50 estricto, 0x57 tolerante (para no matar FORMAT)
+    bool strictChk = !verify;
+
+    if (!readAtariWriteData(buf, expectedLen, strictChk)){
+      logf("[SIO] Fallo leyendo DATA WRITE desde Atari %s sec=%u", devName(dev), sec);
+      sendAtariComplete(false);
+      return;
+    }
+
+    bool ok = writeRemoteSector(dev, sec, dd, buf, expectedLen, verify);
+    sendAtariComplete(ok);
+    return;
+  }
+
+  // Otros comandos no soportados
+  delayMicroseconds(800);
+  SerialSIO.write(SIO_NAK);
+  SerialSIO.flush();
+  logf("[SIO] Cmd no soportado 0x%02X para %s => NAK", base, devName(dev));
 }
 
 // ========= Máquina de estados para COMMAND =========
 
-bool inCommand = false;
-uint8_t hdrBuf[5];
-uint8_t hdrCount = 0;
-uint32_t cmdStartMicros = 0;
+bool     inCommand       = false;
+uint8_t  hdrBuf[5];
+uint8_t  hdrCount        = 0;
+uint32_t cmdStartMicros  = 0;
 
 // ========= SETUP / LOOP =========
 
 void setup(){
- Serial.begin(115200);
- Serial.println("\n[MASTER] STATUS+READ+FORMAT+WRITE + WEB UI + PREFETCH + NVS D1..D4");
+  Serial.begin(115200);
+  Serial.println("\n[MASTER] STATUS+READ+FORMAT+WRITE+PERCOM + WEB UI + PREFETCH + NVS D1..D4");
 
- pinMode(SIO_COMMAND, INPUT_PULLUP);
- SerialSIO.begin(19200, SERIAL_8N1, SIO_DATA_IN, SIO_DATA_OUT, false);
+  pinMode(SIO_COMMAND, INPUT_PULLUP);
+  SerialSIO.begin(19200, SERIAL_8N1, SIO_DATA_IN, SIO_DATA_OUT, false);
 
- // Init tabla slaves
- for (int i = 0; i < 4; i++){
- slaves[i].present = false;
- slaves[i].supports256 = false;
- memset(slaves[i].mac, 0, 6);
- slaves[i].lastSeen = 0;
- }
+  for (int i = 0; i < 4; i++){
+    slaves[i].present     = false;
+    slaves[i].supports256 = false;
+    memset(slaves[i].mac, 0, 6);
+    slaves[i].lastSeen = 0;
+  }
 
- // Cargar configuración desde NVS (si existe)
- loadConfigFromNvs();
+  loadConfigFromNvs();
 
- // WiFi AP+STA para Web UI + ESP-NOW
- WiFi.mode(WIFI_AP_STA);
- const char* apSsid = "XF551_MASTER";
- const char* apPass = "xf551wifi";
- WiFi.softAP(apSsid, apPass);
+  WiFi.mode(WIFI_AP_STA);
+  const char* apSsid = "XF551_MASTER";
+  const char* apPass = "xf551wifi";
+  WiFi.softAP(apSsid, apPass);
 
- Serial.print("[WIFI] AP SSID: ");
- Serial.println(apSsid);
- Serial.print("[WIFI] AP IP: ");
- Serial.println(WiFi.softAPIP());
+  Serial.print("[WIFI] AP SSID: ");
+  Serial.println(apSsid);
+  Serial.print("[WIFI] AP IP: ");
+  Serial.println(WiFi.softAPIP());
 
- // ESP-NOW
- if (esp_now_init() != ESP_OK){
- Serial.println("[ERR] esp_now_init falló");
- ESP.restart();
- }
- esp_now_register_recv_cb(onDataRecv);
- esp_now_register_send_cb(onDataSent);
+  if (esp_now_init() != ESP_OK){
+    Serial.println("[ERR] esp_now_init falló");
+    ESP.restart();
+  }
+  esp_now_register_recv_cb(onDataRecv);
+  esp_now_register_send_cb(onDataSent);
 
- ensurePeer(BCAST_MAC);
+  ensurePeer(BCAST_MAC);
 
- // WebServer rutas
- server.on("/", handleRoot);
- server.on("/api/status",HTTP_GET, handleApiStatus);
- server.on("/set_timing",HTTP_GET, handleSetTiming);
- server.on("/set_prefetch", HTTP_GET, handleSetPrefetch);
- server.begin();
- Serial.println("[WEB] Servidor HTTP iniciado en puerto 80");
+  server.on("/",           handleRoot);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/set_timing", HTTP_GET, handleSetTiming);
+  server.on("/set_prefetch", HTTP_GET, handleSetPrefetch);
+  server.begin();
+  Serial.println("[WEB] Servidor HTTP iniciado en puerto 80");
 }
 
 void loop(){
- // Atender Web UI
- server.handleClient();
+  server.handleClient();
 
- // Limpiar esclavos inactivos (>60s sin HELLO)
- unsigned long now = millis();
- for (int i = 0; i < 4; i++){
- if (slaves[i].present && (now - slaves[i].lastSeen > 60000)){
- slaves[i].present = false;
- }
- }
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++){
+    if (slaves[i].present && (now - slaves[i].lastSeen > 60000)){
+      slaves[i].present = false;
+    }
+  }
 
- int cmdLevel = digitalRead(SIO_COMMAND);
+  int cmdLevel = digitalRead(SIO_COMMAND);
 
- // Flanco de bajada -> inicio de posible comando
- if (!inCommand && cmdLevel == LOW){
- inCommand = true;
- hdrCount = 0;
- cmdStartMicros = micros();
- }
+  if (!inCommand && cmdLevel == LOW){
+    inCommand      = true;
+    hdrCount       = 0;
+    cmdStartMicros = micros();
+  }
 
- if (inCommand){
- // Acumular bytes de cabecera
- while (SerialSIO.available() && hdrCount < 5){
- hdrBuf[hdrCount++] = SerialSIO.read();
- }
+  if (inCommand){
+    while (SerialSIO.available() && hdrCount < 5){
+      hdrBuf[hdrCount++] = SerialSIO.read();
+    }
 
- // Si ya tenemos 5 bytes, procesamos
- if (hdrCount == 5){
- handleSioHeader(hdrBuf);
- inCommand = false;
- while (SerialSIO.available()) SerialSIO.read();
- }
+    if (hdrCount == 5){
+      handleSioHeader(hdrBuf);
+      inCommand = false;
+      while (SerialSIO.available()) SerialSIO.read();
+    }
 
- // Si COMMAND volvió a HIGH y no alcanzamos cabecera completa, descartamos
- if (cmdLevel == HIGH && hdrCount < 5 && (micros() - cmdStartMicros) > 3000){
- inCommand = false;
- while (SerialSIO.available()) SerialSIO.read();
- }
- }
+    if (cmdLevel == HIGH && hdrCount < 5 && (micros() - cmdStartMicros) > 3000){
+      inCommand = false;
+      while (SerialSIO.available()) SerialSIO.read();
+    }
+  }
 
- delay(1);
+  delay(1);
 }
