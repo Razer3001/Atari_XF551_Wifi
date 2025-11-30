@@ -42,7 +42,7 @@ HardwareSerial SerialSIO(2);
 
 // D1..D4
 #define DEV_MIN 0x31
-#define DEV_MAX 0x38
+#define DEV_MAX 0x34
 
 // Tamaños
 #define SECTOR_128       128
@@ -133,6 +133,38 @@ WebServer server(80);
 // ========= NVS (Preferences) =========
 Preferences prefs;
 const uint32_t CFG_MAGIC = 0xCAFEBABE; // para detectar config válida
+
+// ========= DEBUG: comparar último WRITE vs siguiente READ =========
+struct LastWriteDebug {
+  bool     valid;
+  uint8_t  dev;
+  uint16_t sec;
+  bool     dd;
+  int      len;
+  uint8_t  hash;
+  uint8_t  buf[MAX_SECTOR_BYTES];
+};
+
+LastWriteDebug g_lastWrite = { false, 0, 0, false, 0, 0, {0} };
+
+uint8_t simpleHash(const uint8_t* b, int n) {
+  uint8_t h = 0;
+  for (int i = 0; i < n; i++) {
+    h ^= b[i];
+  }
+  return h;
+}
+
+void logFirstDiff(const uint8_t* a, const uint8_t* b, int n) {
+  for (int i = 0; i < n; i++) {
+    if (a[i] != b[i]) {
+      Serial.printf("[DBG] Primera diferencia en offset %d: WRITE=%02X READ=%02X\n",
+                    i, a[i], b[i]);
+      return;
+    }
+  }
+  Serial.println("[DBG] No se encontró diferencia en los primeros bytes analizados");
+}
 
 // ========= HTML responsive (UI móvil) =========
 
@@ -1332,6 +1364,30 @@ void handleSioHeader(uint8_t f[5]){
       return;
     }
 
+    // === DEBUG: comparar con último WRITE ===
+    if (g_lastWrite.valid &&
+        g_lastWrite.dev == dev &&
+        g_lastWrite.sec == sec &&
+        g_lastWrite.dd  == dd &&
+        g_lastWrite.len == n) {
+
+      uint8_t h = simpleHash(buf, n);
+      if (h == g_lastWrite.hash) {
+        Serial.printf("[DBG] READ MATCH con LAST_WRITE %s sec=%u hash=0x%02X\n",
+                      devName(dev), sec, h);
+      } else {
+        Serial.printf("[DBG] READ MISMATCH con LAST_WRITE %s sec=%u hashW=0x%02X hashR=0x%02X\n",
+                      devName(dev), sec, g_lastWrite.hash, h);
+        logFirstDiff(g_lastWrite.buf, buf, n);
+        logHex("[DBG] WRITE bytes:", g_lastWrite.buf, 16);
+        logHex("[DBG] READ  bytes:", buf, 16);
+      }
+    } else {
+      Serial.printf("[DBG] READ sin LAST_WRITE coincidente para %s sec=%u (valid=%d dev=%02X sec=%u len=%d)\n",
+                    devName(dev), sec, g_lastWrite.valid,
+                    g_lastWrite.dev, g_lastWrite.sec, g_lastWrite.len);
+    }
+
     sendAtariData(buf, n);
     return;
   }
@@ -1456,6 +1512,18 @@ void handleSioHeader(uint8_t f[5]){
       sendAtariComplete(false);
       return;
     }
+
+    // === DEBUG: guardar último WRITE del Atari ===
+    g_lastWrite.valid = true;
+    g_lastWrite.dev   = dev;
+    g_lastWrite.sec   = sec;
+    g_lastWrite.dd    = dd;
+    g_lastWrite.len   = expectedLen;
+    memcpy(g_lastWrite.buf, buf, expectedLen);
+    g_lastWrite.hash  = simpleHash(buf, expectedLen);
+    Serial.printf("[DBG] LAST_WRITE %s sec=%u dd=%s len=%d hash=0x%02X\n",
+                  devName(dev), sec, dd ? "DD" : "SD", expectedLen, g_lastWrite.hash);
+    logHex("[DBG] WRITE primeros bytes:", buf, 16);
 
     bool ok = writeRemoteSector(dev, sec, dd, buf, expectedLen, verify);
     sendAtariComplete(ok);

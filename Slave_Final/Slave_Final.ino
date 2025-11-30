@@ -59,7 +59,7 @@ HardwareSerial SerialSIO(2);
 #define PERCOM_BLOCK_LEN  12
 #define PERCOM_SEC_MAGIC  0xFFFF  // sector "mágico" para distinguir WRITE PERCOM
 
-#define MAX_PREFETCH_SECTORS 4
+#define MAX_PREFETCH_SECTORS 6
 
 // Configura este valor según la unidad que quieras emular:
 const uint8_t DEVICE_ID   = 0x31; // 0x31=D1, 0x32=D2, 0x33=D3, 0x34=D4
@@ -849,7 +849,7 @@ void setup(){
 
 void loop(){
   static unsigned long t0 = 0;
-  if (millis() - t0 > 60000){
+  if (millis() - t0 > 10000){
     sendHello();
     t0 = millis();
   }
