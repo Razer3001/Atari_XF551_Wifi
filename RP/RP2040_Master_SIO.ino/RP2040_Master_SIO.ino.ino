@@ -1,207 +1,141 @@
-/*
-  RP2040 MASTER SIO + ESP32 bridge (STATUS + READ SD/DD)
-  ------------------------------------------------------
-  - Emula D1 ante el Atari:
-      * STATUS (0x53)
-      * READ SECTOR (0x52)
-  - Para cada comando:
-      Atari <-> RP2040 <-> UART <-> ESP32 MASTER <-> ESP-NOW <-> SLAVE <-> XF551
-
-  Densidad:
-    - USE_DD = false → responde 128 bytes (SD)
-    - USE_DD = true  → responde 256 bytes (DD)
-
-  Cableado:
-    SIO Atari <-> RP2040:
-      CMD SIO       -> divisor -> GPIO2 (PIN_CMD)
-      TX SIO (DATA OUT Atari)  -> divisor -> GPIO1 (RX Serial1)
-      RX SIO (DATA IN Atari)   <- GPIO0 (TX Serial1) con resistencia ~1k
-      GND común
-
-    RP2040 <-> ESP32 MASTER:
-      RP GPIO4 (TX Serial2) -> ESP32 GPIO16 (RX2)
-      RP GPIO5 (RX Serial2) <- ESP32 GPIO17 (TX2)
-*/
-
 #include <Arduino.h>
+#include <hardware/uart.h>
+#include <hardware/gpio.h>
 
-// ===== Config densidad =====
-const bool USE_DD = true;   // false = 128 bytes (SD), true = 256 bytes (DD)
+// ================== PINES ==================
 
-// ===== SIO pins (RP2040) =====
-const int PIN_CMD    = 2;    // CMD SIO
-const int PIN_SIO_TX = 0;    // TX hacia Atari
-const int PIN_SIO_RX = 1;    // RX desde Atari
+// SIO Atari
+const int PIN_CMD    = 2;   // CMD SIO (desde Atari, con divisor)
+const int PIN_SIO_TX = 0;   // TX hacia Atari (DATA IN Atari)
+const int PIN_SIO_RX = 1;   // RX desde Atari (DATA OUT Atari)
 
-// UART hacia ESP32
-const int PIN_ESP_TX = 4;    // RP TX -> ESP RX2
-const int PIN_ESP_RX = 5;    // RP RX <- ESP TX2
+// UART hacia ESP32 MASTER (usaremos uart1)
+const int PIN_ESP_TX = 4;   // RP2040 -> ESP32 (RX del ESP)
+const int PIN_ESP_RX = 5;   // ESP32 -> RP2040 (TX del ESP)
 
 // LED de estado
-const int LED_STATUS = 13;   // o 25 según placa
+const int LED_STATUS = LED_BUILTIN;   // en tu RP2 Nano es el del core
 
-// ===== SIO / estado CMD =====
-bool    lastCmdState = HIGH;
-uint8_t cmdBuf[5];
+// Alias para el puerto SIO (Serial1 está mapeado a los pines 0/1 en este core)
+#define SerialSIO Serial1
 
-// ===== Protocolo UART/ESPNOW =====
+// UART de enlace con el MASTER
+#define UART_ESP uart1
+#define UART_ESP_BAUD 115200
+
+// ================== Protocolo UART RP <-> MASTER ==================
+
 #define TYPE_CMD_FRAME    0x01
 #define TYPE_SECTOR_CHUNK 0x10
 #define TYPE_ACK          0x11
 #define TYPE_NAK          0x12
 #define TYPE_HELLO        0x20
 
-#define CHUNK_PAYLOAD     240
-#define MAX_SECTOR_BYTES  256
-#define SECTOR_128        128
-#define SECTOR_256        256
+// Códigos SIO
+#define SIO_ACK      0x41
+#define SIO_NAK      0x4E
+#define SIO_COMPLETE 0x43
+#define SIO_ERROR    0x45
 
-// UART framing
-#define UART_SYNC 0x55
+// Solo D1: por ahora
+const uint8_t SIO_DEV_D1 = 0x31;
 
-// ===== Buffers para sector =====
-static uint8_t sectorBuf[MAX_SECTOR_BYTES];
+// Timings (copiados del MASTER original)
+uint16_t T_ACK_TO_COMPLETE   = 600;   // µs
+uint16_t T_COMPLETE_TO_DATA  = 400;   // µs
+uint16_t T_DATA_TO_CHK       = 80;    // µs
+uint16_t T_CHUNK_DELAY       = 600;   // µs
 
-// ===== Utilidades =====
-uint8_t calcChecksum(const uint8_t* buf, int len) {
-  uint16_t sum = 0;
-  for (int i = 0; i < len; i++) sum += buf[i];
-  return (uint8_t)sum;
+// Estado de la línea CMD
+bool lastCmdState = HIGH;
+
+// Buffer de comando SIO
+uint8_t cmdBuf[5];
+
+// ================== FSM UART desde MASTER ==================
+
+uint8_t  uartState = 0;
+uint8_t  uartLen   = 0;        // LEN = TYPE + PAYLOAD
+uint8_t  uartIdx   = 0;
+uint8_t  uartBuf[260];         // TYPE + PAYLOAD
+
+// Operaciones en curso
+enum CurrentOp : uint8_t {
+  OP_NONE = 0,
+  OP_STATUS,
+  OP_READ
+};
+
+CurrentOp g_currentOp = OP_NONE;
+
+// STATUS remoto
+bool     g_statusDone    = false;
+bool     g_statusSuccess = false;
+uint8_t  g_statusData[4];
+
+// READ remoto
+bool     g_readDone        = false;
+bool     g_readSuccess     = false;
+uint8_t  g_readBuf[256];
+int      g_readLen         = 0;
+uint16_t g_readSec         = 0;
+uint8_t  g_readChunkCount  = 0;
+uint8_t  g_readChunksSeen  = 0;
+
+// ================== Utilidades ==================
+
+uint8_t calcChecksumSIO(const uint8_t *buf, int len) {
+  uint16_t s = 0;
+  for (int i = 0; i < len; i++) {
+    s += buf[i];
+    if (s > 0xFF) s = (s & 0xFF) + 1;   // con acarreo (como en tu MASTER)
+  }
+  return (uint8_t)(s & 0xFF);
 }
 
-// ===== UART TX -> ESP32 =====
-bool sendUartFrameToEsp(const uint8_t* payload, uint8_t len) {
-  if (len == 0) return false;
-  uint8_t chk = calcChecksum(payload, len);
-
-  Serial2.write(UART_SYNC);
-  Serial2.write(len);
-  Serial2.write(payload, len);
-  Serial2.write(chk);
-  Serial2.flush();
-
-  Serial.print(F("[RP2040] UART->ESP len="));
-  Serial.print(len);
-  Serial.print(F(" tipo=0x"));
-  if (payload[0] < 0x10) Serial.print('0');
-  Serial.println(payload[0], HEX);
-
+bool readByteWithTimeoutSIO(uint8_t &outByte, uint16_t timeoutMs) {
+  unsigned long t0 = millis();
+  while (!SerialSIO.available()) {
+    if (millis() - t0 >= timeoutMs) return false;
+  }
+  outByte = (uint8_t)SerialSIO.read();
   return true;
 }
 
-// ===== UART RX <- ESP32: FSM persistente =====
-static uint8_t  uartState    = 0;   // 0=SYNC, 1=LEN, 2=PAYLOAD, 3=CHK
-static uint8_t  uartLen      = 0;
-static uint8_t  uartIdx      = 0;
-static uint32_t uartLastTime = 0;
-static uint8_t  uartRxBuf[255];
-
-bool pollUartFrameFromEsp(uint8_t* payload, uint8_t &lenOut, uint16_t frameTimeoutMs) {
-  bool frameReady = false;
-
-  while (Serial2.available() > 0) {
-    uint8_t b = (uint8_t)Serial2.read();
-    uartLastTime = millis();
-
-    Serial.print(F("[RP UART FSM] state="));
-    Serial.print(uartState);
-    Serial.print(F(" byte=0x"));
-    if (b < 0x10) Serial.print('0');
-    Serial.println(b, HEX);
-
-    switch (uartState) {
-      case 0: // Esperando SYNC
-        if (b == UART_SYNC) {
-          uartState = 1;
-        }
-        break;
-
-      case 1: // LEN
-        uartLen = b;
-        if (uartLen == 0) {
-          uartState = 0;
-        } else {
-          uartIdx   = 0;
-          uartState = 2;
-        }
-        break;
-
-      case 2: // PAYLOAD
-        uartRxBuf[uartIdx++] = b;
-        if (uartIdx >= uartLen) {
-          uartState = 3;
-        }
-        break;
-
-      case 3: { // CHK
-        uint8_t chk = b;
-        uint8_t sum = calcChecksum(uartRxBuf, uartLen);
-        if (chk != sum) {
-          Serial.print(F("[RP2040] UART: checksum inválido (chk=0x"));
-          if (chk < 0x10) Serial.print('0');
-          Serial.print(chk, HEX);
-          Serial.print(F(", sum=0x"));
-          if (sum < 0x10) Serial.print('0');
-          Serial.print(sum, HEX);
-          Serial.println(F("), descartando frame."));
-          uartState = 0;
-        } else {
-          lenOut = uartLen;
-          memcpy(payload, uartRxBuf, uartLen);
-          Serial.print(F("[RP2040] UART RX frame válido len="));
-          Serial.print(uartLen);
-          Serial.print(F(" tipo=0x"));
-          if (payload[0] < 0x10) Serial.print('0');
-          Serial.println(payload[0], HEX);
-          uartState = 0;
-          frameReady = true;
-        }
-        break;
-      }
-    }
-  }
-
-  // Timeout entre bytes
-  if (uartState != 0 && (millis() - uartLastTime > frameTimeoutMs)) {
-    Serial.println(F("[RP2040] UART: timeout mid-frame, reseteando FSM."));
-    uartState = 0;
-    uartIdx   = 0;
-    uartLen   = 0;
-  }
-
-  return frameReady;
-}
-
-// ===== Debug SIO =====
 void dumpCommandFrame(const uint8_t *buf) {
   uint8_t dev  = buf[0];
   uint8_t cmd  = buf[1];
   uint8_t aux1 = buf[2];
   uint8_t aux2 = buf[3];
   uint8_t chk  = buf[4];
-  uint8_t calc = calcChecksum(buf, 4);
+  uint8_t calc = calcChecksumSIO(buf, 4);
 
   Serial.print(F("[SIO] Frame CMD: DEV=0x"));
   if (dev < 0x10) Serial.print('0');
   Serial.print(dev, HEX);
+
   Serial.print(F(" CMD=0x"));
   if (cmd < 0x10) Serial.print('0');
   Serial.print(cmd, HEX);
+
   Serial.print(F(" AUX1=0x"));
   if (aux1 < 0x10) Serial.print('0');
   Serial.print(aux1, HEX);
+
   Serial.print(F(" AUX2=0x"));
   if (aux2 < 0x10) Serial.print('0');
   Serial.print(aux2, HEX);
+
   Serial.print(F(" CHK=0x"));
   if (chk < 0x10) Serial.print('0');
   Serial.print(chk, HEX);
+
   Serial.print(F(" (calc=0x"));
   if (calc < 0x10) Serial.print('0');
   Serial.print(calc, HEX);
   Serial.println(F(")"));
 
-  if (dev == 0x31) {
+  if (dev == SIO_DEV_D1) {
     Serial.println(F("[SIO] → Comando dirigido a D1: (0x31)"));
   } else {
     Serial.print(F("[SIO] → Dispositivo distinto de D1: 0x"));
@@ -210,359 +144,432 @@ void dumpCommandFrame(const uint8_t *buf) {
   }
 }
 
-// ===== Lee comando SIO con realineación =====
-bool readCommandFrame() {
-  Serial.println(F("[SIO] CMD ↓ detectado, leyendo frame de comando..."));
+// ================== UART → MASTER ==================
 
-  const int FRAME_LEN = 5;
-  int count = 0;
-  while (count < FRAME_LEN) {
-    unsigned long start = millis();
-    while (!Serial1.available() && (millis() - start < 10)) {}
-    if (!Serial1.available()) {
-      Serial.print(F("[SIO] Timeout leyendo byte inicial "));
-      Serial.println(count);
-      return false;
-    }
-    cmdBuf[count++] = (uint8_t)Serial1.read();
-  }
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    uint8_t dev  = cmdBuf[0];
-    uint8_t cmd  = cmdBuf[1];
-    uint8_t aux1 = cmdBuf[2];
-    uint8_t aux2 = cmdBuf[3];
-    uint8_t chk  = cmdBuf[4];
-    uint8_t calc = calcChecksum(cmdBuf, 4);
-
-    Serial.print(F("[SIO] Intento "));
-    Serial.print(attempt);
-    Serial.print(F(" -> DEV=0x"));
-    if (dev < 0x10) Serial.print('0');
-    Serial.print(dev, HEX);
-    Serial.print(F(" CMD=0x"));
-    if (cmd < 0x10) Serial.print('0');
-    Serial.print(cmd, HEX);
-    Serial.print(F(" AUX1=0x"));
-    if (aux1 < 0x10) Serial.print('0');
-    Serial.print(aux1, HEX);
-    Serial.print(F(" AUX2=0x"));
-    if (aux2 < 0x10) Serial.print('0');
-    Serial.print(aux2, HEX);
-    Serial.print(F(" CHK=0x"));
-    if (chk < 0x10) Serial.print('0');
-    Serial.print(chk, HEX);
-    Serial.print(F(" (calc=0x"));
-    if (calc < 0x10) Serial.print('0');
-    Serial.print(calc, HEX);
-    Serial.println(F(")"));
-
-    if (chk == calc) {
-      Serial.println(F("[SIO] Frame CMD alineado correctamente."));
-      dumpCommandFrame(cmdBuf);
-      return true;
-    }
-
-    if (attempt < 3) {
-      Serial.println(F("[SIO] Checksum inválido, intentando realinear frame..."));
-      cmdBuf[0] = cmdBuf[1];
-      cmdBuf[1] = cmdBuf[2];
-      cmdBuf[2] = cmdBuf[3];
-      cmdBuf[3] = cmdBuf[4];
-
-      unsigned long start = millis();
-      while (!Serial1.available() && (millis() - start < 10)) {}
-      if (!Serial1.available()) {
-        Serial.println(F("[SIO] Timeout leyendo byte extra para realineación."));
-        return false;
-      }
-      cmdBuf[4] = (uint8_t)Serial1.read();
-    }
-  }
-
-  Serial.println(F("[SIO] No se encontró frame con checksum válido tras realinear."));
-  return false;
+void uartSendByte(uint8_t b) {
+  uart_putc_raw(UART_ESP, b);
 }
 
-// ===== Envía al Atari ACK + DATA + CHK + COMPLETE =====
-void sioSendDataFrame(const uint8_t* data, int len) {
-  uint8_t chk = calcChecksum(data, len);
+void uartSendFrame(uint8_t type, const uint8_t *payload, uint8_t payloadLen) {
+  uint8_t len = 1 + payloadLen; // TYPE + PAYLOAD
 
-  delayMicroseconds(1500);
-  Serial1.write(0x41); // ACK
+  // Checksum SOLO sobre TYPE + PAYLOAD
+  uint8_t sum = type;
+  for (uint8_t i = 0; i < payloadLen; i++) {
+    sum += payload[i];
+  }
 
-  delayMicroseconds(1500);
-  Serial1.write(data, len);
-  Serial1.write(chk);
+  uartSendByte(0x55);
+  uartSendByte(len);
+  uartSendByte(type);
+  if (payloadLen > 0) {
+    uart_write_blocking(UART_ESP, payload, payloadLen);
+  }
+  uartSendByte(sum);
 
-  delayMicroseconds(1500);
-  Serial1.write(0x43); // COMPLETE
-
-  Serial.print(F("[SIO] DATA enviado len="));
+  Serial.print(F("[RP2040] UART->ESP len="));
   Serial.print(len);
-  Serial.print(F(" CHK=0x"));
-  if (chk < 0x10) Serial.print('0');
-  Serial.println(chk, HEX);
+  Serial.print(F(" tipo=0x"));
+  if (type < 0x10) Serial.print('0');
+  Serial.println(type, HEX);
 }
 
-// ===== Lógica remota STATUS =====
-bool remoteStatus(uint8_t dev, uint8_t *outStatus4) {
-  uint8_t tx[7];
-  tx[0] = TYPE_CMD_FRAME;
-  tx[1] = 0x53;     // STATUS
-  tx[2] = dev;
-  tx[3] = 0x00;
-  tx[4] = 0x00;
-  tx[5] = 0;
-  tx[6] = 1;
+// ================== Procesar frame recibido del MASTER ==================
 
-  Serial.println(F("[RP2040] Enviando CMD_FRAME STATUS a ESP32..."));
-  sendUartFrameToEsp(tx, 7);
-
-  bool gotChunk = false;
-  unsigned long t0 = millis();
-
-  while (millis() - t0 < 5000) {
-    uint8_t buf[255];
-    uint8_t len;
-    if (!pollUartFrameFromEsp(buf, len, 50)) {
-      delay(5);
-      continue;
-    }
-
-    uint8_t type = buf[0];
-
-    if (type == TYPE_ACK && len >= 2) {
-      if (buf[1] == dev)
-        Serial.println(F("[RP2040] STATUS: ACK recibido desde SLAVE (vía ESP)."));
-    }
-    else if (type == TYPE_NAK && len >= 2) {
-      if (buf[1] == dev) {
-        Serial.println(F("[RP2040] STATUS: NAK recibido desde SLAVE."));
-        return false;
+void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
+  // 'data' = payload (sin TYPE)
+  switch (type) {
+    case TYPE_HELLO: {
+      if (len >= 2) {
+        uint8_t devId  = data[0];
+        uint8_t sup256 = data[1];
+        Serial.print(F("[RP2040] HELLO SLAVE DEV=0x"));
+        if (devId < 0x10) Serial.print('0');
+        Serial.print(devId, HEX);
+        Serial.print(F(" DD="));
+        Serial.println(sup256 ? 1 : 0);
       }
-    }
-    else if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-      uint8_t rdev = buf[1];
-      if (rdev != dev) continue;
+    } break;
 
-      uint16_t sec = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-      if (sec != 0) continue;
+    case TYPE_ACK: {
+      Serial.println(F("[RP2040] ACK desde SLAVE (MASTER)"));
+      // Para READ/STATUS el dato llega via SECTOR_CHUNK
+    } break;
 
-      uint8_t chunkIdx   = buf[4];
-      uint8_t chunkCount = buf[5];
-      int dataLen        = len - 6;
-
-      Serial.print(F("[RP2040] STATUS: chunk "));
-      Serial.print(chunkIdx);
-      Serial.print(F("/"));
-      Serial.print(chunkCount);
-      Serial.print(F(" dataLen="));
-      Serial.println(dataLen);
-
-      if (chunkIdx == 0 && dataLen >= 4) {
-        memcpy(outStatus4, buf + 6, 4);
-        gotChunk = true;
-        break;
+    case TYPE_NAK: {
+      Serial.println(F("[RP2040] NAK desde SLAVE (MASTER)"));
+      if (g_currentOp == OP_STATUS) {
+        g_statusDone    = true;
+        g_statusSuccess = false;
+      } else if (g_currentOp == OP_READ) {
+        g_readDone    = true;
+        g_readSuccess = false;
       }
-    }
-    else {
-      Serial.print(F("[RP2040] UART RX tipo desconocido 0x"));
-      if (type < 0x10) Serial.print('0');
-      Serial.println(type, HEX);
-    }
-  }
+      g_currentOp = OP_NONE;
+    } break;
 
-  if (!gotChunk) {
-    Serial.println(F("[RP2040] STATUS: no se recibió bloque de 4 bytes."));
-    return false;
-  }
-  return true;
-}
-
-// ===== Lógica remota READ SD / DD =====
-bool remoteRead(uint8_t dev, uint16_t sector, bool dd, uint8_t *outBuf, int expectedLen) {
-  uint8_t tx[7];
-  tx[0] = TYPE_CMD_FRAME;
-  tx[1] = 0x52; // READ
-  tx[2] = dev;
-  tx[3] = (uint8_t)(sector & 0xFF);
-  tx[4] = (uint8_t)(sector >> 8);
-  tx[5] = dd ? 1 : 0;
-  tx[6] = 1;
-
-  Serial.print(F("[RP2040] Enviando CMD_FRAME READ sec="));
-  Serial.print(sector);
-  Serial.print(F(" ("));
-  Serial.print(dd ? F("DD 256") : F("SD 128"));
-  Serial.println(F(")"));
-  sendUartFrameToEsp(tx, 7);
-
-  bool ok = false;
-  uint8_t tmp[MAX_SECTOR_BYTES];
-  int finalLen        = 0;
-  uint8_t chunkCount  = 0;
-  uint8_t chunksGot   = 0;
-
-  unsigned long t0 = millis();
-
-  while (millis() - t0 < 8000) {
-    uint8_t buf[255];
-    uint8_t len;
-    if (!pollUartFrameFromEsp(buf, len, 50)) {
-      delay(5);
-      continue;
-    }
-
-    uint8_t type = buf[0];
-
-    if (type == TYPE_ACK && len >= 2) {
-      if (buf[1] == dev)
-        Serial.println(F("[RP2040] READ: ACK recibido desde SLAVE."));
-    }
-    else if (type == TYPE_NAK && len >= 2) {
-      if (buf[1] == dev) {
-        Serial.println(F("[RP2040] READ: NAK recibido desde SLAVE."));
-        return false;
-      }
-    }
-    else if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-      uint8_t rdev = buf[1];
-      if (rdev != dev) continue;
-
-      uint16_t rsec = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-      if (rsec != sector) continue;
-
-      uint8_t idx = buf[4];
-      uint8_t cc  = buf[5];
-      int dataLen = len - 6;
-
-      if (idx == 0) {
-        memset(tmp, 0, MAX_SECTOR_BYTES);
-        finalLen   = 0;
-        chunkCount = cc;
-        chunksGot  = 0;
+    case TYPE_SECTOR_CHUNK: {
+      // payload: [dev, secL, secH, idx, count, data...]
+      if (len < 5) {
+        Serial.println(F("[RP2040] SECTOR_CHUNK demasiado corto"));
+        return;
       }
 
-      int off = idx * CHUNK_PAYLOAD;
-      if (off + dataLen > MAX_SECTOR_BYTES) {
-        dataLen = MAX_SECTOR_BYTES - off;
-      }
-      memcpy(tmp + off, buf + 6, dataLen);
+      uint8_t dev    = data[0];
+      uint16_t sec   = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
+      uint8_t idx    = data[3];
+      uint8_t count  = data[4];
+      int     dlen   = len - 5;
+      const uint8_t *payload = data + 5;
 
-      chunksGot++;
-      finalLen = off + dataLen;
-
-      Serial.print(F("[RP2040] READ: chunk "));
+      Serial.print(F("[RP2040] SECTOR_CHUNK dev=0x"));
+      if (dev < 0x10) Serial.print('0');
+      Serial.print(dev, HEX);
+      Serial.print(F(" sec="));
+      Serial.print(sec);
+      Serial.print(F(" idx="));
       Serial.print(idx);
       Serial.print(F("/"));
-      Serial.print(cc);
+      Serial.print(count);
       Serial.print(F(" dataLen="));
-      Serial.print(dataLen);
-      Serial.print(F(" finalLen="));
-      Serial.println(finalLen);
+      Serial.println(dlen);
 
-      if (chunksGot >= cc) {
-        ok = true;
-        break;
+      // STATUS: sec=0, esperamos 4 bytes
+      if (g_currentOp == OP_STATUS && sec == 0) {
+        int copyLen = (dlen > 4) ? 4 : dlen;
+        memcpy(g_statusData, payload, copyLen);
+        g_statusDone    = true;
+        g_statusSuccess = (copyLen == 4);
+        g_currentOp     = OP_NONE;
+        if (!g_statusSuccess) {
+          Serial.println(F("[RP2040] STATUS: longitud distinta de 4"));
+        }
+        return;
       }
-    }
-    else {
+
+      // READ: sec == g_readSec
+      if (g_currentOp == OP_READ && sec == g_readSec) {
+        if (idx == 0) {
+          g_readLen        = 0;
+          g_readChunkCount = count;
+          g_readChunksSeen = 0;
+        }
+
+        if (g_readLen + dlen > (int)sizeof(g_readBuf)) {
+          dlen = sizeof(g_readBuf) - g_readLen;
+        }
+        if (dlen > 0) {
+          memcpy(g_readBuf + g_readLen, payload, dlen);
+          g_readLen += dlen;
+        }
+        g_readChunksSeen++;
+
+        if (g_readChunksSeen >= g_readChunkCount) {
+          g_readDone    = true;
+          g_readSuccess = true;
+          g_currentOp   = OP_NONE;
+          Serial.print(F("[RP2040] READ completo sec="));
+          Serial.print(sec);
+          Serial.print(F(" len="));
+          Serial.println(g_readLen);
+        }
+        return;
+      }
+
+    } break;
+
+    default:
       Serial.print(F("[RP2040] UART RX tipo desconocido 0x"));
       if (type < 0x10) Serial.print('0');
       Serial.println(type, HEX);
+      break;
+  }
+}
+
+// ================== FSM UART desde MASTER ==================
+
+void serviceUartFromMaster() {
+  while (uart_is_readable(UART_ESP)) {
+    uint8_t b = (uint8_t)uart_getc(UART_ESP);
+
+    switch (uartState) {
+      case 0: // Esperar 0x55
+        if (b == 0x55) {
+          uartState = 1;
+        }
+        break;
+
+      case 1: // LEN
+        uartLen = b;      // LEN = TYPE + PAYLOAD
+        uartIdx = 0;
+        uartState = 2;
+        break;
+
+      case 2: // TYPE + PAYLOAD
+        uartBuf[uartIdx++] = b;
+        if (uartIdx >= uartLen) {
+          uartState = 3;  // siguiente byte = CHK
+        }
+        break;
+
+      case 3: { // CHK
+        uint8_t chk = b;
+
+        // Checksum sobre TYPE + PAYLOAD
+        uint8_t sum = 0;
+        for (uint8_t i = 0; i < uartLen; i++) {
+          sum += uartBuf[i];
+        }
+
+        if (sum == chk) {
+          uint8_t type  = uartBuf[0];
+          uint8_t *data = &uartBuf[1];
+          uint8_t plen  = uartLen - 1;
+
+          Serial.print(F("[RP UART FSM] frame válido len="));
+          Serial.print(uartLen);
+          Serial.print(F(" tipo=0x"));
+          if (type < 0x10) Serial.print('0');
+          Serial.println(type, HEX);
+
+          onMasterFrame(type, data, plen);
+        } else {
+          Serial.print(F("[RP UART FSM] checksum inválido (chk=0x"));
+          if (chk < 0x10) Serial.print('0');
+          Serial.print(chk, HEX);
+          Serial.print(F(", sum=0x"));
+          if (sum < 0x10) Serial.print('0');
+          Serial.print(sum, HEX);
+          Serial.println(F("), descartando frame."));
+        }
+
+        uartState = 0;
+      } break;
+
+      default:
+        uartState = 0;
+        break;
     }
   }
+}
 
-  if (!ok) {
-    Serial.println(F("[RP2040] READ: no se recibieron todos los chunks."));
+// ================== SIO → Atari ==================
+
+void sendAtariData(const uint8_t *buf, int len) {
+  // COMPLETE
+  delayMicroseconds(T_ACK_TO_COMPLETE);
+  SerialSIO.write(SIO_COMPLETE);
+  SerialSIO.flush();
+  Serial.println(F("[SIO] COMPLETE enviado"));
+
+  // DATA
+  delayMicroseconds(T_COMPLETE_TO_DATA);
+  SerialSIO.write(buf, len);
+  SerialSIO.flush();
+  Serial.print(F("[SIO] DATA enviado len="));
+  Serial.println(len);
+
+  // CHK
+  delayMicroseconds(T_DATA_TO_CHK);
+  uint8_t chk = calcChecksumSIO(buf, len);
+  SerialSIO.write(chk);
+  SerialSIO.flush();
+  Serial.print(F("[SIO] CHK=0x"));
+  if (chk < 0x10) Serial.print('0');
+  Serial.println(chk, HEX);
+
+  delayMicroseconds(T_CHUNK_DELAY);
+}
+
+// ================== Operaciones remotas ==================
+
+bool doRemoteStatus(uint8_t dev) {
+  uint8_t payload[6];
+  payload[0] = 0x53;      // CMD STATUS
+  payload[1] = dev;
+  payload[2] = 0;
+  payload[3] = 0;
+  payload[4] = 0;         // densFlag
+  payload[5] = 0;         // prefetch
+
+  g_currentOp     = OP_STATUS;
+  g_statusDone    = false;
+  g_statusSuccess = false;
+
+  Serial.println(F("[RP2040] Enviando CMD_FRAME STATUS a ESP32..."));
+  uartSendFrame(TYPE_CMD_FRAME, payload, 6);
+
+  unsigned long t0 = millis();
+  const unsigned long TIMEOUT_MS = 5000;
+  while (!g_statusDone && (millis() - t0) < TIMEOUT_MS) {
+    serviceUartFromMaster();
+  }
+  g_currentOp = OP_NONE;
+
+  if (!g_statusDone || !g_statusSuccess) {
+    Serial.println(F("[RP2040] STATUS remoto FALLÓ, no se envía data."));
     return false;
   }
 
-  if (finalLen > expectedLen) finalLen = expectedLen;
-  memcpy(outBuf, tmp, finalLen);
+  Serial.println(F("[RP2040] STATUS remoto OK, reenviando al Atari."));
+  sendAtariData(g_statusData, 4);
   return true;
 }
 
-// ===== SETUP & LOOP =====
+bool doRemoteRead(uint8_t dev, uint16_t sec) {
+  uint8_t payload[6];
+  payload[0] = 0x52;                 // CMD READ
+  payload[1] = dev;
+  payload[2] = (uint8_t)(sec & 0xFF);
+  payload[3] = (uint8_t)(sec >> 8);
+  payload[4] = 0;                    // densFlag
+  payload[5] = 1;                    // prefetch
+
+  g_currentOp    = OP_READ;
+  g_readDone     = false;
+  g_readSuccess  = false;
+  g_readSec      = sec;
+  g_readLen      = 0;
+  g_readChunkCount = 0;
+  g_readChunksSeen = 0;
+
+  Serial.print(F("[RP2040] Enviando CMD_FRAME READ sec="));
+  Serial.print(sec);
+  Serial.println(F(" a ESP32..."));
+  uartSendFrame(TYPE_CMD_FRAME, payload, 6);
+
+  unsigned long t0 = millis();
+  const unsigned long TIMEOUT_MS = 8000;
+  while (!g_readDone && (millis() - t0) < TIMEOUT_MS) {
+    serviceUartFromMaster();
+  }
+  g_currentOp = OP_NONE;
+
+  if (!g_readDone || !g_readSuccess || g_readLen <= 0) {
+    Serial.println(F("[RP2040] READ remoto FALLÓ."));
+    return false;
+  }
+
+  Serial.print(F("[RP2040] READ remoto OK, len="));
+  Serial.println(g_readLen);
+  sendAtariData(g_readBuf, g_readLen);
+  return true;
+}
+
+// ================== SIO: lectura del frame ==================
+
+bool readSioCommandFrame(uint8_t buf[5]) {
+  for (int i = 0; i < 5; i++) {
+    if (!readByteWithTimeoutSIO(buf[i], 5)) {
+      Serial.print(F("[SIO] Timeout leyendo byte "));
+      Serial.println(i);
+      return false;
+    }
+  }
+  dumpCommandFrame(buf);
+  return true;
+}
+
+// ================== Manejo del comando SIO ==================
+
+void handleSioCommand() {
+  if (!readSioCommandFrame(cmdBuf)) {
+    return;
+  }
+
+  uint8_t dev  = cmdBuf[0];
+  uint8_t cmd  = cmdBuf[1];
+  uint8_t aux1 = cmdBuf[2];
+  uint8_t aux2 = cmdBuf[3];
+
+  if (dev != SIO_DEV_D1) {
+    Serial.print(F("[RP2040] DEV distinto de D1: 0x"));
+    if (dev < 0x10) Serial.print('0');
+    Serial.println(dev, HEX);
+    return;
+  }
+
+  uint8_t base = cmd & 0x7F;
+  uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
+
+  // STATUS
+  if (base == 0x53) {
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.println(F("[SIO] ACK enviado (STATUS)"));
+    delayMicroseconds(800);
+    doRemoteStatus(dev);
+    return;
+  }
+
+  // READ SECTOR
+  if (base == 0x52) {
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.print(F("[SIO] ACK enviado (READ) sec="));
+    Serial.println(sec);
+    delayMicroseconds(800);
+    doRemoteRead(dev, sec);
+    return;
+  }
+
+  // Otros comandos aún no implementados – NAK
+  delayMicroseconds(800);
+  SerialSIO.write(SIO_NAK);
+  SerialSIO.flush();
+  Serial.print(F("[SIO] CMD no soportado base=0x"));
+  if (base < 0x10) Serial.print('0');
+  Serial.println(base, HEX);
+}
+
+// ================== SETUP / LOOP ==================
 
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) {}
-
-  Serial.println(F("\n=== RP2040 MASTER SIO + ESP32 bridge (STATUS + READ SD/DD) ==="));
-  Serial.print(F("[CONF] USE_DD = "));
-  Serial.println(USE_DD ? F("true (256 bytes)") : F("false (128 bytes)"));
-
-  pinMode(PIN_CMD, INPUT_PULLUP);
   pinMode(LED_STATUS, OUTPUT);
   digitalWrite(LED_STATUS, LOW);
 
-  Serial1.setRX(PIN_SIO_RX);
-  Serial1.setTX(PIN_SIO_TX);
-  Serial1.begin(19200);
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
 
-  Serial2.setTX(PIN_ESP_TX);
-  Serial2.setRX(PIN_ESP_RX);
-  Serial2.begin(115200);
+  Serial.println(F("\n[RP2040] Frente SIO + UART MASTER listo (RP2 Nano)"));
+
+  // SIO a 19200 8N1 en Serial1 (pines 0/1 por defecto)
+  SerialSIO.begin(19200);
+
+  pinMode(PIN_CMD, INPUT_PULLUP);
+
+  // UART1 hacia ESP32 MASTER en pines 4/5
+  uart_init(UART_ESP, UART_ESP_BAUD);
+  gpio_set_function(PIN_ESP_TX, GPIO_FUNC_UART);
+  gpio_set_function(PIN_ESP_RX, GPIO_FUNC_UART);
 
   lastCmdState = digitalRead(PIN_CMD);
+
+  digitalWrite(LED_STATUS, HIGH);
 }
 
 void loop() {
-  bool cmdState = digitalRead(PIN_CMD);
+  // 1) Procesar cualquier cosa que llegue del MASTER
+  serviceUartFromMaster();
 
+  // 2) Detectar flanco CMD ↓ desde el Atari
+  int cmdState = digitalRead(PIN_CMD);
   if (lastCmdState == HIGH && cmdState == LOW) {
-    digitalWrite(LED_STATUS, HIGH);
+    Serial.println(F("[SIO] CMD ↓ detectado, leyendo frame de comando..."));
+    handleSioCommand();
+  }
+  lastCmdState = cmdState;
 
-    if (readCommandFrame()) {
-      uint8_t dev  = cmdBuf[0];
-      uint8_t cmd  = cmdBuf[1];
-      uint8_t aux1 = cmdBuf[2];
-      uint8_t aux2 = cmdBuf[3];
-
-      if (dev == 0x31) { // D1
-        if (cmd == 0x53) {
-          uint8_t st[4];
-          if (remoteStatus(dev, st)) {
-            Serial.println(F("[RP2040] STATUS remoto OK, reenviando al Atari."));
-            sioSendDataFrame(st, 4);
-          } else {
-            Serial.println(F("[RP2040] STATUS remoto FALLÓ, no se envía data."));
-          }
-        }
-        else if (cmd == 0x52) { // READ
-          uint16_t sector = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
-          if (USE_DD) {
-            if (remoteRead(dev, sector, true, sectorBuf, SECTOR_256)) {
-              Serial.println(F("[RP2040] READ remoto DD OK, reenviando 256 bytes al Atari."));
-              sioSendDataFrame(sectorBuf, SECTOR_256);
-            } else {
-              Serial.println(F("[RP2040] READ remoto DD FALLÓ."));
-            }
-          } else {
-            if (remoteRead(dev, sector, false, sectorBuf, SECTOR_128)) {
-              Serial.println(F("[RP2040] READ remoto SD OK, reenviando 128 bytes al Atari."));
-              sioSendDataFrame(sectorBuf, SECTOR_128);
-            } else {
-              Serial.println(F("[RP2040] READ remoto SD FALLÓ."));
-            }
-          }
-        }
-        else {
-          Serial.print(F("[RP2040] CMD no manejado para D1: 0x"));
-          if (cmd < 0x10) Serial.print('0');
-          Serial.println(cmd, HEX);
-        }
-      } else {
-        Serial.print(F("[RP2040] DEV distinto de D1: 0x"));
-        if (dev < 0x10) Serial.print('0');
-        Serial.println(dev, HEX);
-      }
-    }
-
-    digitalWrite(LED_STATUS, LOW);
+  // 3) Drenar bytes sueltos del SIO si aparecen (debug opcional)
+  while (SerialSIO.available() > 0) {
+    uint8_t b = (uint8_t)SerialSIO.read();
+    (void)b;
+    // Para debug:
+    // Serial.print("[SIO RAW] 0x");
+    // if (b < 0x10) Serial.print('0');
+    // Serial.println(b, HEX);
   }
 
-  lastCmdState = cmdState;
+  delay(1);
 }
+z
