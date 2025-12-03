@@ -671,11 +671,22 @@ bool doRemotePercomWrite(uint8_t dev, const uint8_t *data) {
 // WRITE SECTOR (0x50 / 0x57)
 bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len) {
   uint8_t payload[6];
-  payload[0] = cmd;                         // 0x50 / 0x57 (y variantes con bit 7)
+
+  // *** CAMBIO: normalizamos 0x57 → 0x50 para el MASTER/SLAVE
+  uint8_t wireCmd = cmd;
+  if ((cmd & 0x7F) == 0x57) {
+    // De cara al SLAVE lo tratamos igual que un WRITE normal.
+    wireCmd = 0x50;
+  }
+
+  payload[0] = wireCmd;                     // 0x50 en la práctica
   payload[1] = dev;
   payload[2] = (uint8_t)(sec & 0xFF);
   payload[3] = (uint8_t)(sec >> 8);
-  payload[4] = dd ? 1 : 0;                  // densFlag
+
+  // *** CAMBIO: de momento densFlag siempre 0 (SD). La densidad real se
+  // maneja en el SLAVE usando PERCOM; aquí solo bridgemos el sector.
+  payload[4] = 0;                           // densFlag SD
   payload[5] = 0;                           // prefetch no aplica
 
   g_currentOp      = OP_WRITE;
@@ -686,7 +697,10 @@ bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_
   Serial.print(F("[RP2040] Enviando CMD_FRAME WRITE cmd=0x"));
   if (cmd < 0x10) Serial.print('0');
   Serial.print(cmd, HEX);
-  Serial.print(F(" dev=0x"));
+  Serial.print(F(" (wire=0x"));
+  if (wireCmd < 0x10) Serial.print('0');
+  Serial.print(wireCmd, HEX);
+  Serial.print(F(") dev=0x"));
   if (dev < 0x10) Serial.print('0');
   Serial.print(dev, HEX);
   Serial.print(F(" sec="));
@@ -874,8 +888,12 @@ void handleSioCommand() {
 
   // WRITE SECTOR (0x50 / 0x57)
   if (base == 0x50 || base == 0x57) {
-    bool dd = (base == 0x57);
-    int expectedLen = dd ? 256 : 128;
+    // *** CAMBIO: 0x57 (WRITE WITH VERIFY) usa el MISMO tamaño de sector
+    // que 0x50 en el bus SIO. La verificación se hace dentro de la unidad,
+    // no cambiando el tamaño del frame.
+    bool isVerify   = (base == 0x57);   // por si más adelante quieres usarlo
+    int expectedLen = 128;              // por ahora siempre 128 (SD)
+
     uint8_t dataBuf[256];
 
     SerialSIO.write(SIO_ACK);
@@ -927,7 +945,8 @@ void handleSioCommand() {
     }
 
     // Enviar WRITE remoto a MASTER/ESCLAVO
-    if (doRemoteWrite(dev, sec, cmd, dd, dataBuf, expectedLen)) {
+    // *** CAMBIO: dd=false, de momento la densidad se maneja en el SLAVE.
+    if (doRemoteWrite(dev, sec, cmd, false, dataBuf, expectedLen)) {
       // Si todo OK, devolvemos COMPLETE al Atari
       delayMicroseconds(T_ACK_TO_COMPLETE);
       SerialSIO.write(SIO_COMPLETE);
