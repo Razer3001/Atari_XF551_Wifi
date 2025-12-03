@@ -53,7 +53,7 @@ HardwareSerial SerialSIO(2);
 const uint8_t DEVICE_ID   = 0x31; // D1
 const bool    supports256 = true; // XF551 soporta DD
 
-const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF};
 
 uint8_t g_lastMaster[6]  = {0};
 bool    g_haveMasterMac  = false;
@@ -65,13 +65,13 @@ static uint8_t  cacheCount    = 0;
 static uint8_t  cacheDev      = 0;
 static bool     cacheDD       = false;
 
-// WRITE buffers
+// WRITE buffers (no tocados aquí)
 static uint8_t  writeBuf[MAX_SECTOR_BYTES];
 static uint16_t writeSec       = 0;
 static int      writeLen       = 0;
 static bool     writeBufReady  = false;
 
-// PERCOM WRITE buffer
+// PERCOM WRITE buffer (no tocado aquí)
 static uint8_t  percomWriteBuf[PERCOM_BLOCK_LEN];
 static int      percomLen      = 0;
 static bool     percomBufReady = false;
@@ -380,9 +380,47 @@ void handleStatusFromMaster(uint8_t dev, bool dd) {
        (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
 }
 
-// FORMAT, PERCOM, WRITE están igual que en tu código original,
-// los dejo por brevedad, pero se pueden copiar tal cual del que ya pegaste.
-// (Si quieres que los vuelva a pegar completos con logs, lo hago en otro mensaje).
+// FORMAT 0x21 / 0x22
+void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2, bool dd) {
+  (void)dd; // la XF551 siempre devuelve 128 bytes de resultado
+
+  uint8_t frame[5];
+  frame[0] = dev;
+  frame[1] = cmd;    // 0x21 / 0x22
+  frame[2] = aux1;   // se preservan aux1/aux2 por si el DOS los usa
+  frame[3] = aux2;
+  frame[4] = sioChecksum(frame, 4);
+
+  logf("[SLAVE D%u] FORMAT XF cmd=0x%02X aux1=0x%02X aux2=0x%02X",
+       (unsigned)(dev - 0x30), cmd, aux1, aux2);
+
+  pulseCommandAndSendFrame(frame);
+
+  if (!waitByte(SIO_ACK, 5000)) {
+    logf("[SLAVE D%u] FORMAT: sin ACK del drive", (unsigned)(dev - 0x30));
+    sendNAK();
+    return;
+  }
+
+  // El FORMAT puede tardar bastante; esperamos el COMPLETE + 128 bytes
+  uint8_t buf[SECTOR_128];
+  if (!readFromDrive(buf, SECTOR_128, 60000)) {
+    logf("[SLAVE D%u] FORMAT: fallo lectura bloque resultado",
+         (unsigned)(dev - 0x30));
+    sendNAK();
+    return;
+  }
+
+  // Invalida la caché de prefetch: el disco cambió
+  cacheCount = 0;
+
+  sendACK();
+  sendSectorChunk(0, buf, SECTOR_128);
+  logf("[SLAVE D%u] FORMAT cmd=0x%02X OK (128 bytes resultado)",
+       (unsigned)(dev - 0x30), cmd);
+}
+
+// (WRITE / PERCOM se pueden añadir aquí igual que en tu código previo)
 
 // ================== CALLBACK ESP-NOW ==================
 
@@ -408,22 +446,23 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
   uint8_t type = in[0];
 
   if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-    // WRITE/PERCOM; idéntico a tu código, omitido por brevedad
-    // ...
+    // Aquí iría la lógica de WRITE/PERCOM (igual que tu código original)
     return;
   }
 
   if (type == TYPE_CMD_FRAME && len >= 6) {
-    uint8_t cmd   = in[1];
-    uint8_t dev   = in[2];
-    uint16_t sec  = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
-    bool dd       = (in[5] != 0);
-    uint8_t pf    = 1;
+    uint8_t cmd  = in[1];
+    uint8_t dev  = in[2];
+    uint8_t aux1 = in[3];
+    uint8_t aux2 = in[4];
+    bool    dd   = (in[5] != 0);
+    uint8_t pf   = 1;
     if (len >= 7) pf = in[6];
 
     if (dev != DEVICE_ID) return;
 
     uint8_t base = cmd & 0x7F;
+    uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
 
     if (base == 0x52) {
       handleReadFromMaster(dev, sec, dd, pf);
@@ -435,8 +474,12 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
       return;
     }
 
-    // FORMAT, PERCOM, WRITE igual que antes...
-    // ...
+    if (base == 0x21 || base == 0x22) {
+      handleFormatFromMaster(dev, cmd, aux1, aux2, dd);
+      return;
+    }
+
+    // Aquí irían WRITE (0x50/0x57) y PERCOM (0x4E/0x4F) como en tu código
     sendNAK();
     return;
   }
@@ -471,21 +514,22 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len) {
 
   if (type == TYPE_SECTOR_CHUNK && len >= 6) {
     // WRITE/PERCOM igual que tu código previo
-    // ...
     return;
   }
 
   if (type == TYPE_CMD_FRAME && len >= 6) {
-    uint8_t cmd   = in[1];
-    uint8_t dev   = in[2];
-    uint16_t sec  = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
-    bool dd       = (in[5] != 0);
-    uint8_t pf    = 1;
+    uint8_t cmd  = in[1];
+    uint8_t dev  = in[2];
+    uint8_t aux1 = in[3];
+    uint8_t aux2 = in[4];
+    bool    dd   = (in[5] != 0);
+    uint8_t pf   = 1;
     if (len >= 7) pf = in[6];
 
     if (dev != DEVICE_ID) return;
 
     uint8_t base = cmd & 0x7F;
+    uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
 
     if (base == 0x52) {
       handleReadFromMaster(dev, sec, dd, pf);
@@ -497,8 +541,12 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len) {
       return;
     }
 
-    // FORMAT, PERCOM, WRITE igual que antes...
-    // ...
+    if (base == 0x21 || base == 0x22) {
+      handleFormatFromMaster(dev, cmd, aux1, aux2, dd);
+      return;
+    }
+
+    // WRITE / PERCOM...
     sendNAK();
     return;
   }

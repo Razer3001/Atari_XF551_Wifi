@@ -14,9 +14,9 @@ const int PIN_ESP_TX = 4;   // RP2040 -> ESP32 (RX del ESP)
 const int PIN_ESP_RX = 5;   // ESP32 -> RP2040 (TX del ESP)
 
 // LED de estado
-const int LED_STATUS = LED_BUILTIN;   // en tu RP2 Nano es el del core
+const int LED_STATUS = LED_BUILTIN;   // RP2 Nano
 
-// Alias para el puerto SIO (Serial1 está mapeado a los pines 0/1 en este core)
+// Alias para el puerto SIO
 #define SerialSIO Serial1
 
 // UART de enlace con el MASTER
@@ -37,10 +37,14 @@ const int LED_STATUS = LED_BUILTIN;   // en tu RP2 Nano es el del core
 #define SIO_COMPLETE 0x43
 #define SIO_ERROR    0x45
 
-// Solo D1: por ahora
+// Solo D1
 const uint8_t SIO_DEV_D1 = 0x31;
 
-// Timings (copiados del MASTER original)
+// PERCOM
+#define PERCOM_BLOCK_LEN 12
+#define PERCOM_SEC_MAGIC 0xFFFF
+
+// Timings (los mismos que tu MASTER original)
 uint16_t T_ACK_TO_COMPLETE   = 600;   // µs
 uint16_t T_COMPLETE_TO_DATA  = 400;   // µs
 uint16_t T_DATA_TO_CHK       = 80;    // µs
@@ -63,7 +67,10 @@ uint8_t  uartBuf[260];         // TYPE + PAYLOAD
 enum CurrentOp : uint8_t {
   OP_NONE = 0,
   OP_STATUS,
-  OP_READ
+  OP_READ,
+  OP_FORMAT,
+  OP_PERCOM,   // NUEVO
+  OP_WRITE     // NUEVO
 };
 
 CurrentOp g_currentOp = OP_NONE;
@@ -82,13 +89,29 @@ uint16_t g_readSec         = 0;
 uint8_t  g_readChunkCount  = 0;
 uint8_t  g_readChunksSeen  = 0;
 
+// FORMAT remoto (bloque de 128 bytes)
+bool     g_formatDone      = false;
+bool     g_formatSuccess   = false;
+uint8_t  g_formatBuf[128];
+int      g_formatLen       = 0;
+
+// PERCOM remoto (12 bytes)
+bool     g_percomDone      = false;
+bool     g_percomSuccess   = false;
+uint8_t  g_percomBuf[PERCOM_BLOCK_LEN];
+
+// WRITE remoto (solo ACK/NAK)
+bool     g_writeDone       = false;
+bool     g_writeSuccess    = false;
+uint16_t g_writeSec        = 0;
+
 // ================== Utilidades ==================
 
 uint8_t calcChecksumSIO(const uint8_t *buf, int len) {
   uint16_t s = 0;
   for (int i = 0; i < len; i++) {
     s += buf[i];
-    if (s > 0xFF) s = (s & 0xFF) + 1;   // con acarreo (como en tu MASTER)
+    if (s > 0xFF) s = (s & 0xFF) + 1;   // con acarreo
   }
   return (uint8_t)(s & 0xFF);
 }
@@ -153,7 +176,6 @@ void uartSendByte(uint8_t b) {
 void uartSendFrame(uint8_t type, const uint8_t *payload, uint8_t payloadLen) {
   uint8_t len = 1 + payloadLen; // TYPE + PAYLOAD
 
-  // Checksum SOLO sobre TYPE + PAYLOAD
   uint8_t sum = type;
   for (uint8_t i = 0; i < payloadLen; i++) {
     sum += payload[i];
@@ -174,10 +196,17 @@ void uartSendFrame(uint8_t type, const uint8_t *payload, uint8_t payloadLen) {
   Serial.println(type, HEX);
 }
 
+// ================== Declaración de funciones remotas ==================
+
+bool doRemoteStatus(uint8_t dev);
+bool doRemoteRead(uint8_t dev, uint16_t sec);
+bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);
+bool doRemotePercomRead(uint8_t dev);
+bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len);
+
 // ================== Procesar frame recibido del MASTER ==================
 
 void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
-  // 'data' = payload (sin TYPE)
   switch (type) {
     case TYPE_HELLO: {
       if (len >= 2) {
@@ -193,7 +222,12 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
 
     case TYPE_ACK: {
       Serial.println(F("[RP2040] ACK desde SLAVE (MASTER)"));
-      // Para READ/STATUS el dato llega via SECTOR_CHUNK
+      // Para WRITE, el ACK indica que la escritura fue correcta
+      if (g_currentOp == OP_WRITE) {
+        g_writeDone    = true;
+        g_writeSuccess = true;
+        g_currentOp    = OP_NONE;
+      }
     } break;
 
     case TYPE_NAK: {
@@ -204,12 +238,20 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
       } else if (g_currentOp == OP_READ) {
         g_readDone    = true;
         g_readSuccess = false;
+      } else if (g_currentOp == OP_FORMAT) {
+        g_formatDone    = true;
+        g_formatSuccess = false;
+      } else if (g_currentOp == OP_PERCOM) {
+        g_percomDone    = true;
+        g_percomSuccess = false;
+      } else if (g_currentOp == OP_WRITE) {
+        g_writeDone    = true;
+        g_writeSuccess = false;
       }
       g_currentOp = OP_NONE;
     } break;
 
     case TYPE_SECTOR_CHUNK: {
-      // payload: [dev, secL, secH, idx, count, data...]
       if (len < 5) {
         Serial.println(F("[RP2040] SECTOR_CHUNK demasiado corto"));
         return;
@@ -234,7 +276,7 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
       Serial.print(F(" dataLen="));
       Serial.println(dlen);
 
-      // STATUS: sec=0, esperamos 4 bytes
+      // STATUS: sec=0, 4 bytes
       if (g_currentOp == OP_STATUS && sec == 0) {
         int copyLen = (dlen > 4) ? 4 : dlen;
         memcpy(g_statusData, payload, copyLen);
@@ -276,6 +318,41 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
         return;
       }
 
+      // FORMAT: sec=0, 128 bytes
+      if (g_currentOp == OP_FORMAT && sec == 0) {
+        int copyLen = (dlen > (int)sizeof(g_formatBuf)) ? sizeof(g_formatBuf) : dlen;
+        memcpy(g_formatBuf, payload, copyLen);
+        g_formatLen      = copyLen;
+        g_formatDone     = true;
+        g_formatSuccess  = (copyLen > 0);
+        g_currentOp      = OP_NONE;
+
+        if (!g_formatSuccess) {
+          Serial.println(F("[RP2040] FORMAT: longitud 0"));
+        } else {
+          Serial.print(F("[RP2040] FORMAT resultado len="));
+          Serial.println(g_formatLen);
+        }
+        return;
+      }
+
+      // PERCOM: sector mágico 0xFFFF, 12 bytes
+      if (g_currentOp == OP_PERCOM && sec == PERCOM_SEC_MAGIC) {
+        int copyLen = (dlen > PERCOM_BLOCK_LEN) ? PERCOM_BLOCK_LEN : dlen;
+        memcpy(g_percomBuf, payload, copyLen);
+        g_percomDone     = true;
+        g_percomSuccess  = (copyLen == PERCOM_BLOCK_LEN);
+        g_currentOp      = OP_NONE;
+
+        if (!g_percomSuccess) {
+          Serial.println(F("[RP2040] PERCOM: longitud incorrecta"));
+        } else {
+          Serial.print(F("[RP2040] PERCOM resultado len="));
+          Serial.println(copyLen);
+        }
+        return;
+      }
+
     } break;
 
     default:
@@ -300,7 +377,7 @@ void serviceUartFromMaster() {
         break;
 
       case 1: // LEN
-        uartLen = b;      // LEN = TYPE + PAYLOAD
+        uartLen = b;
         uartIdx = 0;
         uartState = 2;
         break;
@@ -315,7 +392,6 @@ void serviceUartFromMaster() {
       case 3: { // CHK
         uint8_t chk = b;
 
-        // Checksum sobre TYPE + PAYLOAD
         uint8_t sum = 0;
         for (uint8_t i = 0; i < uartLen; i++) {
           sum += uartBuf[i];
@@ -422,14 +498,14 @@ bool doRemoteRead(uint8_t dev, uint16_t sec) {
   payload[1] = dev;
   payload[2] = (uint8_t)(sec & 0xFF);
   payload[3] = (uint8_t)(sec >> 8);
-  payload[4] = 0;                    // densFlag
-  payload[5] = 1;                    // prefetch
+  payload[4] = 0;                    // densFlag (por ahora SD)
+  payload[5] = 1;                    // prefetch básico
 
-  g_currentOp    = OP_READ;
-  g_readDone     = false;
-  g_readSuccess  = false;
-  g_readSec      = sec;
-  g_readLen      = 0;
+  g_currentOp      = OP_READ;
+  g_readDone       = false;
+  g_readSuccess    = false;
+  g_readSec        = sec;
+  g_readLen        = 0;
   g_readChunkCount = 0;
   g_readChunksSeen = 0;
 
@@ -453,6 +529,149 @@ bool doRemoteRead(uint8_t dev, uint16_t sec) {
   Serial.print(F("[RP2040] READ remoto OK, len="));
   Serial.println(g_readLen);
   sendAtariData(g_readBuf, g_readLen);
+  return true;
+}
+
+// FORMAT remoto (0x21 / 0x22)
+bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
+  uint8_t payload[6];
+  payload[0] = cmd;       // 0x21 / 0x22 (y posibles variantes con bit 7)
+  payload[1] = dev;
+  payload[2] = aux1;      // se preservan aux1/aux2 tal como llegan del Atari
+  payload[3] = aux2;
+
+  uint8_t base = (cmd & 0x7F);
+  uint8_t densFlag = 0;
+  if (base == 0x22) {
+    // si quieres marcar DD para la XF551 real
+    densFlag = 1;
+  }
+  payload[4] = densFlag;
+  payload[5] = 0;         // prefetch no aplica para FORMAT
+
+  g_currentOp       = OP_FORMAT;
+  g_formatDone      = false;
+  g_formatSuccess   = false;
+  g_formatLen       = 0;
+
+  Serial.print(F("[RP2040] Enviando CMD_FRAME FORMAT cmd=0x"));
+  if (cmd < 0x10) Serial.print('0');
+  Serial.print(cmd, HEX);
+  Serial.print(F(" dev=0x"));
+  if (dev < 0x10) Serial.print('0');
+  Serial.print(dev, HEX);
+  Serial.print(F(" aux1=0x"));
+  if (aux1 < 0x10) Serial.print('0');
+  Serial.print(aux1, HEX);
+  Serial.print(F(" aux2=0x"));
+  if (aux2 < 0x10) Serial.print('0');
+  Serial.print(aux2, HEX);
+  Serial.println(F(" a ESP32..."));
+
+  uartSendFrame(TYPE_CMD_FRAME, payload, 6);
+
+  unsigned long t0 = millis();
+  const unsigned long TIMEOUT_MS = 60000UL; // FORMAT puede tardar
+  while (!g_formatDone && (millis() - t0) < TIMEOUT_MS) {
+    serviceUartFromMaster();
+  }
+  g_currentOp = OP_NONE;
+
+  if (!g_formatDone || !g_formatSuccess || g_formatLen <= 0) {
+    Serial.println(F("[RP2040] FORMAT remoto FALLÓ."));
+    return false;
+  }
+
+  Serial.print(F("[RP2040] FORMAT remoto OK, len="));
+  Serial.println(g_formatLen);
+  sendAtariData(g_formatBuf, g_formatLen);
+  return true;
+}
+
+// READ PERCOM (0x4E)
+bool doRemotePercomRead(uint8_t dev) {
+  uint8_t payload[6];
+  payload[0] = 0x4E;                        // CMD READ PERCOM
+  payload[1] = dev;
+  payload[2] = (uint8_t)(PERCOM_SEC_MAGIC & 0xFF);
+  payload[3] = (uint8_t)(PERCOM_SEC_MAGIC >> 8);
+  payload[4] = 0;                           // densFlag (no aplica)
+  payload[5] = 0;                           // prefetch no aplica
+
+  g_currentOp      = OP_PERCOM;
+  g_percomDone     = false;
+  g_percomSuccess  = false;
+
+  Serial.println(F("[RP2040] Enviando CMD_FRAME READ PERCOM a ESP32..."));
+  uartSendFrame(TYPE_CMD_FRAME, payload, 6);
+
+  unsigned long t0 = millis();
+  const unsigned long TIMEOUT_MS = 5000;
+  while (!g_percomDone && (millis() - t0) < TIMEOUT_MS) {
+    serviceUartFromMaster();
+  }
+  g_currentOp = OP_NONE;
+
+  if (!g_percomDone || !g_percomSuccess) {
+    Serial.println(F("[RP2040] READ PERCOM remoto FALLÓ."));
+    return false;
+  }
+
+  Serial.println(F("[RP2040] READ PERCOM remoto OK, reenviando al Atari."));
+  sendAtariData(g_percomBuf, PERCOM_BLOCK_LEN);
+  return true;
+}
+
+// WRITE SECTOR (0x50 / 0x57)
+bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len) {
+  uint8_t payload[6];
+  payload[0] = cmd;                         // 0x50 / 0x57 (y variantes con bit 7)
+  payload[1] = dev;
+  payload[2] = (uint8_t)(sec & 0xFF);
+  payload[3] = (uint8_t)(sec >> 8);
+  payload[4] = dd ? 1 : 0;                  // densFlag
+  payload[5] = 0;                           // prefetch no aplica
+
+  g_currentOp      = OP_WRITE;
+  g_writeDone      = false;
+  g_writeSuccess   = false;
+  g_writeSec       = sec;
+
+  Serial.print(F("[RP2040] Enviando CMD_FRAME WRITE cmd=0x"));
+  if (cmd < 0x10) Serial.print('0');
+  Serial.print(cmd, HEX);
+  Serial.print(F(" dev=0x"));
+  if (dev < 0x10) Serial.print('0');
+  Serial.print(dev, HEX);
+  Serial.print(F(" sec="));
+  Serial.println(sec);
+
+  // 1) Comando WRITE
+  uartSendFrame(TYPE_CMD_FRAME, payload, 6);
+
+  // 2) Enviar el bloque de datos como SECTOR_CHUNK idx=0, count=1
+  uint8_t chunk[5 + 256];
+  chunk[0] = dev;
+  chunk[1] = (uint8_t)(sec & 0xFF);
+  chunk[2] = (uint8_t)(sec >> 8);
+  chunk[3] = 0;        // idx
+  chunk[4] = 1;        // count
+  memcpy(chunk + 5, data, len);
+  uartSendFrame(TYPE_SECTOR_CHUNK, chunk, 5 + (uint8_t)len);
+
+  unsigned long t0 = millis();
+  const unsigned long TIMEOUT_MS = 8000;
+  while (!g_writeDone && (millis() - t0) < TIMEOUT_MS) {
+    serviceUartFromMaster();
+  }
+  g_currentOp = OP_NONE;
+
+  if (!g_writeDone || !g_writeSuccess) {
+    Serial.println(F("[RP2040] WRITE remoto FALLÓ."));
+    return false;
+  }
+
+  Serial.println(F("[RP2040] WRITE remoto OK."));
   return true;
 }
 
@@ -502,6 +721,16 @@ void handleSioCommand() {
     return;
   }
 
+  // READ PERCOM (0x4E)
+  if (base == 0x4E) {
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.println(F("[SIO] ACK enviado (READ PERCOM)"));
+    delayMicroseconds(800);
+    doRemotePercomRead(dev);
+    return;
+  }
+
   // READ SECTOR
   if (base == 0x52) {
     SerialSIO.write(SIO_ACK);
@@ -510,6 +739,96 @@ void handleSioCommand() {
     Serial.println(sec);
     delayMicroseconds(800);
     doRemoteRead(dev, sec);
+    return;
+  }
+
+  // FORMAT (0x21 / 0x22)
+  if (base == 0x21 || base == 0x22) {
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.print(F("[SIO] ACK enviado (FORMAT cmd=0x"));
+    if (cmd < 0x10) Serial.print('0');
+    Serial.print(cmd, HEX);
+    Serial.print(F(") aux1=0x"));
+    if (aux1 < 0x10) Serial.print('0');
+    Serial.print(aux1, HEX);
+    Serial.print(F(" aux2=0x"));
+    if (aux2 < 0x10) Serial.print('0');
+    Serial.println(aux2, HEX);
+
+    // El Atari ahora esperará el bloque de resultado (128 bytes)
+    delayMicroseconds(800);
+    doRemoteFormat(dev, cmd, aux1, aux2);
+    return;
+  }
+
+  // WRITE SECTOR (0x50 / 0x57)
+  if (base == 0x50 || base == 0x57) {
+    bool dd = (base == 0x57);
+    int expectedLen = dd ? 256 : 128;
+    uint8_t dataBuf[256];
+
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.print(F("[SIO] ACK enviado (WRITE cmd=0x"));
+    if (cmd < 0x10) Serial.print('0');
+    Serial.print(cmd, HEX);
+    Serial.print(F(") sec="));
+    Serial.println(sec);
+
+    // Pequeña pausa antes de recibir los datos
+    delayMicroseconds(800);
+
+    // Leer los datos desde el Atari
+    for (int i = 0; i < expectedLen; i++) {
+      if (!readByteWithTimeoutSIO(dataBuf[i], 100)) {
+        Serial.print(F("[SIO] Timeout leyendo DATA de WRITE en byte "));
+        Serial.println(i);
+        SerialSIO.write(SIO_ERROR);
+        SerialSIO.flush();
+        Serial.println(F("[SIO] ERROR enviado (timeout DATA WRITE)"));
+        return;
+      }
+    }
+
+    // Leer checksum
+    uint8_t chkRecv;
+    if (!readByteWithTimeoutSIO(chkRecv, 100)) {
+      Serial.println(F("[SIO] Timeout leyendo CHK de WRITE"));
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      Serial.println(F("[SIO] ERROR enviado (timeout CHK WRITE)"));
+      return;
+    }
+
+    uint8_t chkCalc = calcChecksumSIO(dataBuf, expectedLen);
+    Serial.print(F("[SIO] WRITE CHK recv=0x"));
+    if (chkRecv < 0x10) Serial.print('0');
+    Serial.print(chkRecv, HEX);
+    Serial.print(F(" calc=0x"));
+    if (chkCalc < 0x10) Serial.print('0');
+    Serial.println(chkCalc, HEX);
+
+    if (chkRecv != chkCalc) {
+      Serial.println(F("[SIO] Checksum WRITE inválido, enviando ERROR"));
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      return;
+    }
+
+    // Enviar WRITE remoto a MASTER/ESCLAVO
+    if (doRemoteWrite(dev, sec, cmd, dd, dataBuf, expectedLen)) {
+      // Si todo OK, devolvemos COMPLETE al Atari
+      delayMicroseconds(T_ACK_TO_COMPLETE);
+      SerialSIO.write(SIO_COMPLETE);
+      SerialSIO.flush();
+      Serial.println(F("[SIO] COMPLETE enviado (WRITE OK)"));
+    } else {
+      Serial.println(F("[SIO] WRITE remoto FALLÓ, enviando ERROR"));
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+    }
+
     return;
   }
 
@@ -533,7 +852,7 @@ void setup() {
 
   Serial.println(F("\n[RP2040] Frente SIO + UART MASTER listo (RP2 Nano)"));
 
-  // SIO a 19200 8N1 en Serial1 (pines 0/1 por defecto)
+  // SIO a 19200 8N1 en Serial1 (pines 0/1)
   SerialSIO.begin(19200);
 
   pinMode(PIN_CMD, INPUT_PULLUP);
@@ -549,7 +868,7 @@ void setup() {
 }
 
 void loop() {
-  // 1) Procesar cualquier cosa que llegue del MASTER
+  // 1) Procesar frames que llegan del MASTER
   serviceUartFromMaster();
 
   // 2) Detectar flanco CMD ↓ desde el Atari
@@ -560,16 +879,11 @@ void loop() {
   }
   lastCmdState = cmdState;
 
-  // 3) Drenar bytes sueltos del SIO si aparecen (debug opcional)
+  // 3) Drenar bytes sueltos del SIO (opcional)
   while (SerialSIO.available() > 0) {
     uint8_t b = (uint8_t)SerialSIO.read();
     (void)b;
-    // Para debug:
-    // Serial.print("[SIO RAW] 0x");
-    // if (b < 0x10) Serial.print('0');
-    // Serial.println(b, HEX);
   }
 
   delay(1);
 }
-z
