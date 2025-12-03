@@ -65,16 +65,27 @@ static uint8_t  cacheCount    = 0;
 static uint8_t  cacheDev      = 0;
 static bool     cacheDD       = false;
 
-// WRITE buffers (no tocados aquí)
+// WRITE buffers
 static uint8_t  writeBuf[MAX_SECTOR_BYTES];
 static uint16_t writeSec       = 0;
 static int      writeLen       = 0;
 static bool     writeBufReady  = false;
 
-// PERCOM WRITE buffer (no tocado aquí)
+// Estado WRITE pendiente (CMD_FRAME recibido, esperando DATA)
+static bool     writePending   = false;
+static uint8_t  writePendDev   = 0;
+static uint8_t  writePendCmd   = 0;
+static bool     writePendDD    = false;
+static uint16_t writePendSec   = 0;
+
+// PERCOM WRITE buffer
 static uint8_t  percomWriteBuf[PERCOM_BLOCK_LEN];
 static int      percomLen      = 0;
 static bool     percomBufReady = false;
+
+// Estado WRITE PERCOM pendiente (CMD_FRAME recibido, esperando DATA)
+static bool     percomWritePending = false;
+static uint8_t  percomWriteDev     = 0;
 
 // ======== Utilidades ========
 
@@ -152,7 +163,7 @@ bool waitByte(uint8_t want, unsigned long timeoutMs) {
     if (SerialSIO.available()) {
       uint8_t b = SerialSIO.read();
       if (b == want) return true;
-      if (b == SIO_NAK && want != SIO_NAK)    return false;
+      if (b == SIO_NAK && want != SIO_NAK)     return false;
       if (b == SIO_ERROR && want != SIO_ERROR) return false;
     }
     delay(1);
@@ -262,6 +273,72 @@ bool writeSectorToXF(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd, const uint
   return true;
 }
 
+// PERCOM: READ
+bool readPercomFromXF(uint8_t dev, uint8_t* outBuf) {
+  uint8_t frame[5];
+  frame[0] = dev;
+  frame[1] = 0x4E; // READ PERCOM
+  frame[2] = 0x00;
+  frame[3] = 0x00;
+  frame[4] = sioChecksum(frame, 4);
+
+  logf("[SLAVE D%u] READ PERCOM XF", (unsigned)(dev - 0x30));
+
+  pulseCommandAndSendFrame(frame);
+
+  if (!waitByte(SIO_ACK, 4000)) {
+    logf("[SLAVE D%u] READ PERCOM: sin ACK del drive", (unsigned)(dev - 0x30));
+    return false;
+  }
+
+  if (!readFromDrive(outBuf, PERCOM_BLOCK_LEN, 8000)) {
+    logf("[SLAVE D%u] READ PERCOM: fallo lectura", (unsigned)(dev - 0x30));
+    return false;
+  }
+
+  logf("[SLAVE D%u] READ PERCOM OK", (unsigned)(dev - 0x30));
+  return true;
+}
+
+// PERCOM: WRITE
+bool writePercomToXF(uint8_t dev, const uint8_t* buf, int len) {
+  uint8_t tmp[PERCOM_BLOCK_LEN];
+  memset(tmp, 0, sizeof(tmp));
+  if (len > PERCOM_BLOCK_LEN) len = PERCOM_BLOCK_LEN;
+  memcpy(tmp, buf, len);
+
+  uint8_t frame[5];
+  frame[0] = dev;
+  frame[1] = 0x4F; // WRITE PERCOM
+  frame[2] = 0x00;
+  frame[3] = 0x00;
+  frame[4] = sioChecksum(frame, 4);
+
+  logf("[SLAVE D%u] WRITE PERCOM XF", (unsigned)(dev - 0x30));
+
+  pulseCommandAndSendFrame(frame);
+
+  if (!waitByte(SIO_ACK, 4000)) {
+    logf("[SLAVE D%u] WRITE PERCOM: sin ACK del drive", (unsigned)(dev - 0x30));
+    return false;
+  }
+
+  SerialSIO.write(tmp, PERCOM_BLOCK_LEN);
+  SerialSIO.flush();
+
+  uint8_t chk = sioChecksum(tmp, PERCOM_BLOCK_LEN);
+  SerialSIO.write(chk);
+  SerialSIO.flush();
+
+  if (!waitByte(SIO_COMPLETE, 20000)) {
+    logf("[SLAVE D%u] WRITE PERCOM: sin COMPLETE del drive", (unsigned)(dev - 0x30));
+    return false;
+  }
+
+  logf("[SLAVE D%u] WRITE PERCOM OK", (unsigned)(dev - 0x30));
+  return true;
+}
+
 void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len) {
   uint8_t pkt[6 + CHUNK_PAYLOAD];
   int cc = (len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
@@ -291,6 +368,10 @@ void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len) {
 // ======== HANDLERS LÓGICOS ========
 
 void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t pfCount) {
+  // Cancelamos posibles WRITE/PERCOM pendientes cuando llega un READ nuevo
+  writePending        = false;
+  percomWritePending  = false;
+
   uint8_t buf[MAX_SECTOR_BYTES];
   int sz  = dd ? SECTOR_256 : SECTOR_128;
   bool servedFromCache = false;
@@ -352,6 +433,10 @@ void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t pfCount) {
 void handleStatusFromMaster(uint8_t dev, bool dd) {
   (void)dd;
 
+  // Cancelamos write/percom pendientes
+  writePending        = false;
+  percomWritePending  = false;
+
   uint8_t frame[5];
   frame[0] = dev;
   frame[1] = 0x53;
@@ -383,6 +468,10 @@ void handleStatusFromMaster(uint8_t dev, bool dd) {
 // FORMAT 0x21 / 0x22
 void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2, bool dd) {
   (void)dd; // la XF551 siempre devuelve 128 bytes de resultado
+
+  // Cancelamos write/percom pendientes (el disco cambió)
+  writePending        = false;
+  percomWritePending  = false;
 
   uint8_t frame[5];
   frame[0] = dev;
@@ -420,7 +509,139 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
        (unsigned)(dev - 0x30), cmd);
 }
 
-// (WRITE / PERCOM se pueden añadir aquí igual que en tu código previo)
+// WRITE SECTOR (0x50/0x57) – sólo marca pendiente; los datos llegan en TYPE_SECTOR_CHUNK
+void handleWriteFromMaster(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd) {
+  writePending   = true;
+  writePendDev   = dev;
+  writePendCmd   = cmd;
+  writePendSec   = sec;
+  writePendDD    = dd;
+  writeBufReady  = false;
+  writeLen       = 0;
+
+  // El disco va a cambiar → invalida cache
+  cacheCount = 0;
+
+  logf("[SLAVE D%u] WRITE pendiente cmd=0x%02X sec=%u (%s)",
+       (unsigned)(dev - 0x30), cmd, sec, dd ? "DD" : "SD");
+}
+
+// READ PERCOM (0x4E)
+void handleReadPercomFromMaster(uint8_t dev) {
+  uint8_t buf[PERCOM_BLOCK_LEN];
+
+  logf("[SLAVE D%u] READ PERCOM solicitado desde MASTER", (unsigned)(dev - 0x30));
+
+  if (!readPercomFromXF(dev, buf)) {
+    sendNAK();
+    return;
+  }
+
+  sendACK();
+  // Usamos PERCOM_SEC_MAGIC para distinguirlo en el RP
+  sendSectorChunk(PERCOM_SEC_MAGIC, buf, PERCOM_BLOCK_LEN);
+  logf("[SLAVE D%u] READ PERCOM OK", (unsigned)(dev - 0x30));
+}
+
+// WRITE PERCOM (0x4F) – CMD_FRAME marca pendiente; data viene en TYPE_SECTOR_CHUNK con sec=PERCOM_SEC_MAGIC
+void handleWritePercomFromMaster(uint8_t dev) {
+  percomWritePending = true;
+  percomWriteDev     = dev;
+  percomBufReady     = false;
+  percomLen          = 0;
+
+  // El disco podría cambiar → invalidamos cache
+  cacheCount = 0;
+
+  logf("[SLAVE D%u] WRITE PERCOM pendiente desde MASTER", (unsigned)(dev - 0x30));
+}
+
+// Manejo común de TYPE_SECTOR_CHUNK (WRITE sector + WRITE PERCOM)
+void handleSectorChunkFromMaster(const uint8_t* in, int len) {
+  if (len < 6) {
+    logf("[SLAVE D%u] SECTOR_CHUNK demasiado corto", (unsigned)(DEVICE_ID - 0x30));
+    return;
+  }
+
+  uint8_t dev      = in[1];
+  uint16_t sec     = (uint16_t)in[2] | ((uint16_t)in[3] << 8);
+  uint8_t idx      = in[4];
+  uint8_t count    = in[5];
+  const uint8_t* payload = &in[6];
+  int dlen        = len - 6;
+
+  logf("[SLAVE D%u] RX SECTOR_CHUNK dev=0x%02X sec=%u idx=%u/%u len=%d",
+       (unsigned)(DEVICE_ID - 0x30), dev, sec, idx, count, dlen);
+
+  // ---- WRITE SECTOR pendiente ----
+  if (writePending &&
+      dev == writePendDev &&
+      sec == writePendSec) {
+
+    if (idx != 0 || count != 1 || dlen <= 0) {
+      logf("[SLAVE D%u] WRITE: chunk inesperado idx=%u count=%u len=%d",
+           (unsigned)(dev - 0x30), idx, count, dlen);
+      sendNAK();
+      writePending = false;
+      return;
+    }
+
+    if (dlen > MAX_SECTOR_BYTES) dlen = MAX_SECTOR_BYTES;
+    memcpy(writeBuf, payload, dlen);
+    writeLen      = dlen;
+    writeBufReady = true;
+
+    bool ok = writeSectorToXF(writePendDev, writePendCmd, writePendSec, writePendDD,
+                              writeBuf, writeLen);
+
+    if (ok) {
+      sendACK();
+    } else {
+      sendNAK();
+    }
+
+    writePending   = false;
+    writeBufReady  = false;
+    writeLen       = 0;
+    return;
+  }
+
+  // ---- WRITE PERCOM pendiente (sec == PERCOM_SEC_MAGIC) ----
+  if (percomWritePending &&
+      dev == percomWriteDev &&
+      sec == PERCOM_SEC_MAGIC) {
+
+    if (idx != 0 || count != 1 || dlen <= 0) {
+      logf("[SLAVE D%u] WRITE PERCOM: chunk inesperado idx=%u count=%u len=%d",
+           (unsigned)(dev - 0x30), idx, count, dlen);
+      sendNAK();
+      percomWritePending = false;
+      return;
+    }
+
+    if (dlen > PERCOM_BLOCK_LEN) dlen = PERCOM_BLOCK_LEN;
+    memcpy(percomWriteBuf, payload, dlen);
+    percomLen      = dlen;
+    percomBufReady = true;
+
+    bool ok = writePercomToXF(percomWriteDev, percomWriteBuf, percomLen);
+
+    if (ok) {
+      sendACK();
+    } else {
+      sendNAK();
+    }
+
+    percomWritePending = false;
+    percomBufReady     = false;
+    percomLen          = 0;
+    return;
+  }
+
+  // Si llega un CHUNK que no corresponde a nada pendiente, lo ignoramos
+  logf("[SLAVE D%u] SECTOR_CHUNK sin operación pendiente asociado, ignorado",
+       (unsigned)(DEVICE_ID - 0x30));
+}
 
 // ================== CALLBACK ESP-NOW ==================
 
@@ -446,7 +667,8 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
   uint8_t type = in[0];
 
   if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-    // Aquí iría la lógica de WRITE/PERCOM (igual que tu código original)
+    // Datos para WRITE SECTOR o WRITE PERCOM
+    handleSectorChunkFromMaster(in, len);
     return;
   }
 
@@ -479,7 +701,25 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
       return;
     }
 
-    // Aquí irían WRITE (0x50/0x57) y PERCOM (0x4E/0x4F) como en tu código
+    if (base == 0x50 || base == 0x57) {
+      // WRITE SECTOR (datos llegarán en TYPE_SECTOR_CHUNK)
+      handleWriteFromMaster(dev, cmd, sec, dd);
+      return;
+    }
+
+    if (base == 0x4E) {
+      // READ PERCOM
+      handleReadPercomFromMaster(dev);
+      return;
+    }
+
+    if (base == 0x4F) {
+      // WRITE PERCOM (datos vendrán en TYPE_SECTOR_CHUNK con sec=PERCOM_SEC_MAGIC)
+      handleWritePercomFromMaster(dev);
+      return;
+    }
+
+    // Comando desconocido
     sendNAK();
     return;
   }
@@ -513,7 +753,7 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len) {
   uint8_t type = in[0];
 
   if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-    // WRITE/PERCOM igual que tu código previo
+    handleSectorChunkFromMaster(in, len);
     return;
   }
 
@@ -546,7 +786,21 @@ void onDataRecv(const uint8_t* src, const uint8_t* in, int len) {
       return;
     }
 
-    // WRITE / PERCOM...
+    if (base == 0x50 || base == 0x57) {
+      handleWriteFromMaster(dev, cmd, sec, dd);
+      return;
+    }
+
+    if (base == 0x4E) {
+      handleReadPercomFromMaster(dev);
+      return;
+    }
+
+    if (base == 0x4F) {
+      handleWritePercomFromMaster(dev);
+      return;
+    }
+
     sendNAK();
     return;
   }
@@ -585,11 +839,13 @@ void setup() {
   ensurePeer(BCAST_MAC);
   sendHello();
 
-  cacheCount      = 0;
-  writeBufReady   = false;
-  writeLen        = 0;
-  percomBufReady  = false;
-  percomLen       = 0;
+  cacheCount        = 0;
+  writeBufReady     = false;
+  writeLen          = 0;
+  writePending      = false;
+  percomBufReady    = false;
+  percomLen         = 0;
+  percomWritePending= false;
 
   logf("[SLAVE] Listo DEV=0x%02X DD=%u", DEVICE_ID, supports256 ? 1 : 0);
 }

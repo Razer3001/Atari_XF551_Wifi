@@ -794,54 +794,68 @@ void pollUartFromRP() {
           Serial.println(type, HEX);
 
           switch (type) {
-            case TYPE_CMD_FRAME: {
-              // Opcional: ajustar prefetch antes de reenviar al SLAVE
-              if (uartLen >= 7) {
-                uint8_t cmd = uartBuf[1];
-                uint8_t dev = uartBuf[2];
-                uint8_t base = cmd & 0x7F;
+                    case TYPE_CMD_FRAME: {
+                      // Opcional: ajustar prefetch antes de reenviar al SLAVE
+                      if (uartLen >= 7) {
+                        uint8_t cmd  = uartBuf[1];
+                        uint8_t dev  = uartBuf[2];
+                        uint8_t base = cmd & 0x7F;
 
-                // Prefetch override
-                uint8_t pf  = prefetchForDev(dev);
-                if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
-                // Si pf>0, sobrescribimos; si es 0, dejamos lo que mande el RP
-                if (pf > 0) {
-                  uartBuf[6] = pf;
-                  logf("[MASTER] Overwrite PREFETCH para %s = %u sectores",
-                       devName(dev), pf);
-                }
+                        // Prefetch override
+                        uint8_t pf  = prefetchForDev(dev);
+                        if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
+                        // Si pf>0, sobrescribimos; si es 0, dejamos lo que mande el RP
+                        if (pf > 0) {
+                          uartBuf[6] = pf;
+                          logf("[MASTER] Overwrite PREFETCH para %s = %u sectores",
+                              devName(dev), pf);
+                        }
 
-                // Detectar WRITE pendiente (0x50 / 0x57)
-                if (base == 0x50 || base == 0x57) {
-                  uint16_t sec = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
-                  g_pendingWriteRP.active = true;
-                  g_pendingWriteRP.dev    = dev;
-                  g_pendingWriteRP.sec    = sec;
-                  logf("[MASTER] WRITE pendiente desde RP dev=%s sec=%u base=0x%02X",
-                       devName(dev), (unsigned)sec, (unsigned)base);
-                }
-              }
+                        // Detectar WRITE pendiente
+                        //  - 0x50 / 0x57 : WRITE SECTOR normal
+                        //  - 0x4F        : WRITE PERCOM (usa sec=0xFFFF en los chunks)
+                        bool isWriteSector = (base == 0x50 || base == 0x57);
+                        bool isWritePercom = (base == 0x4F);
 
-              // Comando desde RP -> reenviar al SLAVE
-              sendEspToSlave(uartBuf, uartLen);
-              Serial.print(F("[MASTER] Enviado payload a SLAVE tipo=0x"));
-              if (type < 0x10) Serial.print('0');
-              Serial.print(type, HEX);
-              Serial.print(F(" len="));
-              Serial.println(uartLen);
-            } break;
+                        if (isWriteSector || isWritePercom) {
+                          uint16_t sec;
+                          if (isWritePercom) {
+                            // Para PERCOM, los CHUNK usan sector "falso" 65535 (0xFFFF)
+                            sec = 0xFFFF;
+                          } else {
+                            // WRITE SECTOR normal: sector real
+                            sec = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
+                          }
 
-            case TYPE_SECTOR_CHUNK: {
+                          g_pendingWriteRP.active = true;
+                          g_pendingWriteRP.dev    = dev;
+                          g_pendingWriteRP.sec    = sec;
+                          logf("[MASTER] WRITE pendiente desde RP dev=%s sec=%u base=0x%02X",
+                              devName(dev), (unsigned)sec, (unsigned)base);
+                        }
+                      }
+
+                      // Comando desde RP -> reenviar al SLAVE
+                      sendEspToSlave(uartBuf, uartLen);
+                      Serial.print(F("[MASTER] Enviado payload a SLAVE tipo=0x"));
+                      if (type < 0x10) Serial.print('0');
+                      Serial.print(type, HEX);
+                      Serial.print(F(" len="));
+                      Serial.println(uartLen);
+                    } break;
+
+
+                    case TYPE_SECTOR_CHUNK: {
               if (uartLen < 6) {
                 Serial.println(F("[MASTER] SECTOR_CHUNK desde RP demasiado corto"));
                 break;
               }
 
-              uint8_t dev = uartBuf[1];
-              uint16_t sec = (uint16_t)uartBuf[2] | ((uint16_t)uartBuf[3] << 8);
-              uint8_t idx = uartBuf[4];
-              uint8_t count = uartBuf[5];
-              int dlen = uartLen - 6;
+              uint8_t dev    = uartBuf[1];
+              uint16_t sec   = (uint16_t)uartBuf[2] | ((uint16_t)uartBuf[3] << 8);
+              uint8_t idx    = uartBuf[4];
+              uint8_t count  = uartBuf[5];
+              int     dlen   = uartLen - 6;
 
               Serial.print(F("[MASTER] SECTOR_CHUNK desde RP dev=0x"));
               if (dev < 0x10) Serial.print('0');
@@ -855,6 +869,20 @@ void pollUartFromRP() {
               Serial.print(F(" dataLen="));
               Serial.println(dlen);
 
+              // Caso especial: PERCOM usa sec=65535 (0xFFFF)
+              bool isPercom = (sec == 0xFFFF);
+
+              if (isPercom) {
+                // Chunks PERCOM: siempre se reenvían al SLAVE, no son WRITE de sector normal
+                sendEspToSlave(uartBuf, uartLen);
+                Serial.println(F("[MASTER] SECTOR_CHUNK PERCOM reenviado al SLAVE (WRITE PERCOM)"));
+
+                // Terminamos el WRITE PERCOM
+                g_pendingWriteRP.active = false;
+                break;
+              }
+
+              // WRITE SECTOR normal: requiere un WRITE pendiente válido
               if (!g_pendingWriteRP.active) {
                 Serial.println(F("[MASTER] SECTOR_CHUNK desde RP sin WRITE pendiente, se ignora"));
                 break;
@@ -870,6 +898,7 @@ void pollUartFromRP() {
 
               g_pendingWriteRP.active = false;
             } break;
+
 
             default:
               // Otros tipos desde RP (no esperados por ahora)
@@ -892,8 +921,7 @@ void pollUartFromRP() {
   }
 }
 
-// ===== ESP-NOW callbacks =====
-#if ESP_IDF_VERSION_MAJOR >= 5
+// ===== ESP-NOW callbacks (API nueva IDF5) =====
 
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* data, int len) {
   if (!data || len <= 0) return;
@@ -954,67 +982,6 @@ void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t s) {
   else
     Serial.println(F("[MASTER] ESP-NOW fallo en envío"));
 }
-
-#else
-
-void onDataRecv(const uint8_t* src, const uint8_t* data, int len) {
-  if (!data || len <= 0) return;
-
-  if (src) {
-    bool isBcast = true;
-    for (int i = 0; i < 6; i++) {
-      if (src[i] != 0xFF) { isBcast = false; break; }
-    }
-    if (!isBcast) {
-      memcpy(g_lastSlave, src, 6);
-      g_haveSlave = true;
-      ensurePeer(g_lastSlave);
-    }
-  }
-
-  uint8_t type = data[0];
-
-  Serial.print(F("[MASTER] onDataRecv type=0x"));
-  if (type < 0x10) Serial.print('0');
-  Serial.print(type, HEX);
-  Serial.print(F(" len="));
-  Serial.println(len);
-
-  if (type == TYPE_HELLO && len >= 3) {
-    uint8_t dev = data[1];
-    uint8_t dd  = data[2];
-
-    Serial.print(F("[MASTER] HELLO de SLAVE DEV=0x"));
-    if (dev < 0x10) Serial.print('0');
-    Serial.println(dev, HEX);
-
-    int idx = devIndex(dev);
-    if (idx >= 0 && src) {
-      slaves[idx].present     = true;
-      slaves[idx].supports256 = (dd != 0);
-      memcpy(slaves[idx].mac, src, 6);
-      slaves[idx].lastSeen = millis();
-      ensurePeer(slaves[idx].mac);
-      logf("[HELLO] %s presente DD=%u MAC=%s",
-           devName(dev), dd ? 1 : 0, formatMac(slaves[idx].mac).c_str());
-    }
-
-    sendUartFrameToRP(data, len);
-  }
-  else if (type == TYPE_SECTOR_CHUNK || type == TYPE_ACK || type == TYPE_NAK) {
-    sendUartFrameToRP(data, len);
-  }
-}
-
-void onDataSent(const uint8_t* mac, esp_now_send_status_t s) {
-  (void)mac;
-  if (s == ESP_NOW_SEND_SUCCESS)
-    Serial.println(F("[MASTER] ESP-NOW envío OK"));
-  else
-    Serial.println(F("[MASTER] ESP-NOW fallo en envío"));
-}
-
-#endif
 
 // ===== SETUP / LOOP =====
 void setup() {

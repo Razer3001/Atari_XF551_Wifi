@@ -69,8 +69,8 @@ enum CurrentOp : uint8_t {
   OP_STATUS,
   OP_READ,
   OP_FORMAT,
-  OP_PERCOM,   // NUEVO
-  OP_WRITE     // NUEVO
+  OP_PERCOM,   // READ PERCOM
+  OP_WRITE     // WRITE sector o WRITE PERCOM
 };
 
 CurrentOp g_currentOp = OP_NONE;
@@ -202,6 +202,7 @@ bool doRemoteStatus(uint8_t dev);
 bool doRemoteRead(uint8_t dev, uint16_t sec);
 bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);
 bool doRemotePercomRead(uint8_t dev);
+bool doRemotePercomWrite(uint8_t dev, const uint8_t *data);  // NUEVO
 bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len);
 
 // ================== Procesar frame recibido del MASTER ==================
@@ -222,7 +223,7 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
 
     case TYPE_ACK: {
       Serial.println(F("[RP2040] ACK desde SLAVE (MASTER)"));
-      // Para WRITE, el ACK indica que la escritura fue correcta
+      // Para WRITE (sector o PERCOM), el ACK indica que la operación fue correcta
       if (g_currentOp == OP_WRITE) {
         g_writeDone    = true;
         g_writeSuccess = true;
@@ -336,7 +337,7 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
         return;
       }
 
-      // PERCOM: sector mágico 0xFFFF, 12 bytes
+      // PERCOM READ: sector mágico 0xFFFF, 12 bytes
       if (g_currentOp == OP_PERCOM && sec == PERCOM_SEC_MAGIC) {
         int copyLen = (dlen > PERCOM_BLOCK_LEN) ? PERCOM_BLOCK_LEN : dlen;
         memcpy(g_percomBuf, payload, copyLen);
@@ -622,6 +623,51 @@ bool doRemotePercomRead(uint8_t dev) {
   return true;
 }
 
+// WRITE PERCOM (0x4F) – nuevo
+bool doRemotePercomWrite(uint8_t dev, const uint8_t *data) {
+  uint8_t payload[6];
+  payload[0] = 0x4F;                        // CMD WRITE PERCOM
+  payload[1] = dev;
+  payload[2] = (uint8_t)(PERCOM_SEC_MAGIC & 0xFF);
+  payload[3] = (uint8_t)(PERCOM_SEC_MAGIC >> 8);
+  payload[4] = 0;                           // densFlag (no aplica)
+  payload[5] = 0;                           // prefetch no aplica
+
+  g_currentOp    = OP_WRITE;                // usamos OP_WRITE (ACK/NAK)
+  g_writeDone    = false;
+  g_writeSuccess = false;
+  g_writeSec     = PERCOM_SEC_MAGIC;
+
+  Serial.println(F("[RP2040] Enviando CMD_FRAME WRITE PERCOM a ESP32..."));
+  uartSendFrame(TYPE_CMD_FRAME, payload, 6);
+
+  // Enviar bloque PERCOM como SECTOR_CHUNK sec=0xFFFF idx=0/1
+  uint8_t chunk[5 + PERCOM_BLOCK_LEN];
+  chunk[0] = dev;
+  chunk[1] = (uint8_t)(PERCOM_SEC_MAGIC & 0xFF);
+  chunk[2] = (uint8_t)(PERCOM_SEC_MAGIC >> 8);
+  chunk[3] = 0;        // idx
+  chunk[4] = 1;        // count
+  memcpy(chunk + 5, data, PERCOM_BLOCK_LEN);
+
+  uartSendFrame(TYPE_SECTOR_CHUNK, chunk, 5 + (uint8_t)PERCOM_BLOCK_LEN);
+
+  unsigned long t0 = millis();
+  const unsigned long TIMEOUT_MS = 8000;
+  while (!g_writeDone && (millis() - t0) < TIMEOUT_MS) {
+    serviceUartFromMaster();
+  }
+  g_currentOp = OP_NONE;
+
+  if (!g_writeDone || !g_writeSuccess) {
+    Serial.println(F("[RP2040] WRITE PERCOM remoto FALLÓ."));
+    return false;
+  }
+
+  Serial.println(F("[RP2040] WRITE PERCOM remoto OK."));
+  return true;
+}
+
 // WRITE SECTOR (0x50 / 0x57)
 bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len) {
   uint8_t payload[6];
@@ -728,6 +774,70 @@ void handleSioCommand() {
     Serial.println(F("[SIO] ACK enviado (READ PERCOM)"));
     delayMicroseconds(800);
     doRemotePercomRead(dev);
+    return;
+  }
+
+  // WRITE PERCOM (0x4F) – NUEVO
+  if (base == 0x4F) {
+    uint8_t percom[PERCOM_BLOCK_LEN];
+
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.println(F("[SIO] ACK enviado (WRITE PERCOM)"));
+
+    // pequeña pausa antes de recibir los datos
+    delayMicroseconds(800);
+
+    // Leer los 12 bytes de PERCOM
+    for (int i = 0; i < PERCOM_BLOCK_LEN; i++) {
+      if (!readByteWithTimeoutSIO(percom[i], 100)) {
+        Serial.print(F("[SIO] Timeout leyendo DATA de WRITE PERCOM en byte "));
+        Serial.println(i);
+        SerialSIO.write(SIO_ERROR);
+        SerialSIO.flush();
+        Serial.println(F("[SIO] ERROR enviado (timeout DATA WRITE PERCOM)"));
+        return;
+      }
+    }
+
+    // Leer checksum
+    uint8_t chkRecv;
+    if (!readByteWithTimeoutSIO(chkRecv, 100)) {
+      Serial.println(F("[SIO] Timeout leyendo CHK de WRITE PERCOM"));
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      Serial.println(F("[SIO] ERROR enviado (timeout CHK WRITE PERCOM)"));
+      return;
+    }
+
+    uint8_t chkCalc = calcChecksumSIO(percom, PERCOM_BLOCK_LEN);
+    Serial.print(F("[SIO] WRITE PERCOM CHK recv=0x"));
+    if (chkRecv < 0x10) Serial.print('0');
+    Serial.print(chkRecv, HEX);
+    Serial.print(F(" calc=0x"));
+    if (chkCalc < 0x10) Serial.print('0');
+    Serial.println(chkCalc, HEX);
+
+    if (chkRecv != chkCalc) {
+      Serial.println(F("[SIO] Checksum WRITE PERCOM inválido, enviando ERROR"));
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+      return;
+    }
+
+    // Enviar WRITE PERCOM remoto a MASTER/SLAVE
+    if (doRemotePercomWrite(dev, percom)) {
+      // Si todo OK, devolvemos COMPLETE al Atari (sin data)
+      delayMicroseconds(T_ACK_TO_COMPLETE);
+      SerialSIO.write(SIO_COMPLETE);
+      SerialSIO.flush();
+      Serial.println(F("[SIO] COMPLETE enviado (WRITE PERCOM OK)"));
+    } else {
+      Serial.println(F("[SIO] WRITE PERCOM remoto FALLÓ, enviando ERROR"));
+      SerialSIO.write(SIO_ERROR);
+      SerialSIO.flush();
+    }
+
     return;
   }
 
