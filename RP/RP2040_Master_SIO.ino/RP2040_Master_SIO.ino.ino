@@ -209,9 +209,13 @@ void uartSendFrame(uint8_t type, const uint8_t *payload, uint8_t payloadLen) {
 // ******* OJO: ahora STATUS recibe aux1/aux2 ********
 bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2);
 bool doRemoteRead(uint8_t dev, uint16_t sec);
-bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);
+
+// ==== FORMAT SEPARADO ====
+bool doRemoteFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);
+bool doRemoteFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);  // CMD 0x22
+
 bool doRemotePercomRead(uint8_t dev);
-bool doRemotePercomWrite(uint8_t dev, const uint8_t *data);  // NUEVO
+bool doRemotePercomWrite(uint8_t dev, const uint8_t *data);
 bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len);
 
 // ================== Procesar frame recibido del MASTER ==================
@@ -489,9 +493,10 @@ bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
   uint8_t payload[6];
   payload[0] = 0x53;      // CMD STATUS
   payload[1] = dev;
-  payload[2] = 0;         // hacia la XF no usamos AUX1/AUX2
-  payload[3] = 0;
-  payload[4] = 0;         // densFlag
+  // *** AHORA SÍ propagamos AUX1/AUX2 ***
+  payload[2] = aux1;
+  payload[3] = aux2;
+  payload[4] = 0;         // densFlag (no aplica a STATUS)
   payload[5] = 0;         // prefetch
 
   g_currentOp     = OP_STATUS;
@@ -513,7 +518,7 @@ bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
     return false;
   }
 
-  // Log STATUS bruto
+  // Log STATUS con AUX1/AUX2 reales
   Serial.print(F("[RP2040] STATUS remoto bruto dev=0x"));
   if (dev < 0x10) Serial.print('0');
   Serial.print(dev, HEX);
@@ -531,26 +536,19 @@ bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
   }
   Serial.println();
 
-  // Hack opcional: sólo para STATUS con AUX1 específico (p.ej. 0x21 post-FORMAT)
+  // Hack opcional sigue igual...
   if (g_enableStatusHack && aux1 == g_statusHackAux1) {
     Serial.println(F("[RP2040] STATUS HACK activo, sobrescribiendo bytes de STATUS..."));
     for (int i = 0; i < 4; i++) {
       g_statusData[i] = g_statusHackData[i];
     }
-
-    Serial.print(F("[RP2040] STATUS HACK DATA="));
-    for (int i = 0; i < 4; i++) {
-      Serial.print(' ');
-      if (g_statusData[i] < 0x10) Serial.print('0');
-      Serial.print(g_statusData[i], HEX);
-    }
-    Serial.println();
   }
 
   Serial.println(F("[RP2040] STATUS remoto OK, reenviando al Atari."));
   sendAtariData(g_statusData, 4);
   return true;
 }
+
 
 bool doRemoteRead(uint8_t dev, uint16_t sec) {
   uint8_t payload[6];
@@ -593,9 +591,10 @@ bool doRemoteRead(uint8_t dev, uint16_t sec) {
 }
 
 // FORMAT remoto (0x21 / 0x22)
-bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
+// === Helper común interno para FORMAT (como tu doRemoteFormat original) ===
+static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   uint8_t payload[6];
-  payload[0] = cmd;       // 0x21 / 0x22 (y posibles variantes con bit 7)
+  payload[0] = cmd;       // OJO: comando EXACTO del Atari (puede ser 0x21, 0x22, 0xA1, etc.)
   payload[1] = dev;
   payload[2] = aux1;      // se preservan aux1/aux2 tal como llegan del Atari
   payload[3] = aux2;
@@ -603,7 +602,7 @@ bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   uint8_t base = (cmd & 0x7F);
   uint8_t densFlag = 0;
   if (base == 0x22) {
-    densFlag = 1;
+    densFlag = 1;         // DD
   }
   payload[4] = densFlag;
   payload[5] = 0;         // prefetch no aplica para FORMAT
@@ -652,9 +651,24 @@ bool doRemoteFormat(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   }
   Serial.println();
 
+  // Enviar de vuelta al Atari
   sendAtariData(g_formatBuf, g_formatLen);
   return true;
 }
+
+// FORMAT SD (base 0x21, pero respeta cmd original: 0x21 o 0xA1)
+bool doRemoteFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
+  Serial.println(F("[RP2040] FORMAT SD (base 0x21) solicitado"));
+  return doRemoteFormatCommon(dev, cmd, aux1, aux2);
+}
+
+// FORMAT DD (base 0x22, respeta cmd original: 0x22 o 0xA2)
+bool doRemoteFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
+  Serial.println(F("[RP2040] FORMAT DD (base 0x22) solicitado"));
+  return doRemoteFormatCommon(dev, cmd, aux1, aux2);
+}
+
+
 
 // READ PERCOM (0x4E)
 bool doRemotePercomRead(uint8_t dev) {
@@ -801,37 +815,21 @@ bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_
 // ================== SIO: lectura del frame ==================
 
 bool readSioCommandFrame(uint8_t buf[5]) {
-  // Primer byte: seamos un poco más generosos
-  if (!readByteWithTimeoutSIO(buf[0], 20)) {
-    Serial.println(F("[SIO] Timeout esperando primer byte de comando (lo ignoro)"));
-    return false;
-  }
+  // Timeout más relajado por byte de comando (antes 5 ms)
+  const uint16_t CMD_BYTE_TIMEOUT_MS = 20;
 
-  // Restantes: deberían llegar seguidos, pero damos un margen
-  for (int i = 1; i < 4; i++) {
-    if (!readByteWithTimeoutSIO(buf[i], 10)) {
+  for (int i = 0; i < 5; i++) {
+    if (!readByteWithTimeoutSIO(buf[i], CMD_BYTE_TIMEOUT_MS)) {
       Serial.print(F("[SIO] Timeout leyendo byte "));
       Serial.println(i);
-      // Re-sincronizar: vaciar lo que quede del frame roto
-      while (SerialSIO.available() > 0) {
-        (void)SerialSIO.read();
-      }
       return false;
     }
   }
-
-  // Byte 4 = checksum
-  if (!readByteWithTimeoutSIO(buf[4], 10)) {
-    Serial.println(F("[SIO] Timeout leyendo checksum de comando"));
-    while (SerialSIO.available() > 0) {
-      (void)SerialSIO.read();
-    }
-    return false;
-  }
-
   dumpCommandFrame(buf);
   return true;
 }
+
+
 
 
 // ================== Manejo del comando SIO ==================
@@ -961,24 +959,45 @@ void handleSioCommand() {
   }
 
   // FORMAT (0x21 / 0x22)
-  if (base == 0x21 || base == 0x22) {
-    SerialSIO.write(SIO_ACK);
-    SerialSIO.flush();
-    Serial.print(F("[SIO] ACK enviado (FORMAT cmd=0x"));
-    if (cmd < 0x10) Serial.print('0');
-    Serial.print(cmd, HEX);
-    Serial.print(F(") aux1=0x"));
-    if (aux1 < 0x10) Serial.print('0');
-    Serial.print(aux1, HEX);
-    Serial.print(F(" aux2=0x"));
-    if (aux2 < 0x10) Serial.print('0');
-    Serial.println(aux2, HEX);
+  // FORMAT SD (0x21 base)
+if (base == 0x21) {
+  SerialSIO.write(SIO_ACK);
+  SerialSIO.flush();
+  Serial.print(F("[SIO] ACK enviado (FORMAT SD cmd=0x"));
+  if (cmd < 0x10) Serial.print('0');
+  Serial.print(cmd, HEX);
+  Serial.print(F(") aux1=0x"));
+  if (aux1 < 0x10) Serial.print('0');
+  Serial.print(aux1, HEX);
+  Serial.print(F(" aux2=0x"));
+  if (aux2 < 0x10) Serial.print('0');
+  Serial.println(aux2, HEX);
 
-    // El Atari ahora esperará el bloque de resultado (128 bytes)
-    delayMicroseconds(800);
-    doRemoteFormat(dev, cmd, aux1, aux2);
-    return;
-  }
+  delayMicroseconds(800);
+  doRemoteFormatSD(dev, cmd, aux1, aux2);  // OJO: pasa cmd completo
+  return;
+}
+
+// FORMAT DD (0x22 base)
+if (base == 0x22) {
+  SerialSIO.write(SIO_ACK);
+  SerialSIO.flush();
+  Serial.print(F("[SIO] ACK enviado (FORMAT DD cmd=0x"));
+  if (cmd < 0x10) Serial.print('0');
+  Serial.print(cmd, HEX);
+  Serial.print(F(") aux1=0x"));
+  if (aux1 < 0x10) Serial.print('0');
+  Serial.print(aux1, HEX);
+  Serial.print(F(" aux2=0x"));
+  if (aux2 < 0x10) Serial.print('0');
+  Serial.println(aux2, HEX);
+
+  delayMicroseconds(800);
+  doRemoteFormatDD(dev, cmd, aux1, aux2);  // OJO: pasa cmd completo
+  return;
+}
+
+
 
   // WRITE SECTOR (0x50 / 0x57)
   if (base == 0x50 || base == 0x57) {

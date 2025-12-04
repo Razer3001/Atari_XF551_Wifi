@@ -486,18 +486,23 @@ void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t pfCount) {
   }
 }
 
-void handleStatusFromMaster(uint8_t dev, bool dd) {
+void handleStatusFromMaster(uint8_t dev, uint8_t aux1, uint8_t aux2, bool dd) {
   (void)dd;
 
+  // Cancelamos write/percom pendientes
   writePending        = false;
   percomWritePending  = false;
 
   uint8_t frame[5];
   frame[0] = dev;
   frame[1] = 0x53;
-  frame[2] = 0x00;
-  frame[3] = 0x00;
+  // *** aquí SÍ usamos aux1/aux2 tal como los mandó el Atari ***
+  frame[2] = aux1;
+  frame[3] = aux2;
   frame[4] = sioChecksum(frame, 4);
+
+  logf("[SLAVE D%u] STATUS XF aux1=0x%02X aux2=0x%02X",
+       (unsigned)(dev - 0x30), aux1, aux2);
 
   pulseCommandAndSendFrame(frame);
 
@@ -520,16 +525,13 @@ void handleStatusFromMaster(uint8_t dev, bool dd) {
        (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
 }
 
-void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2, bool dd) {
-  (void)dd;
 
-  writePending        = false;
-  percomWritePending  = false;
-
+// Helper común para FORMAT (ya lo tienes como formatXF)
+static void formatXF(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   uint8_t frame[5];
   frame[0] = dev;
-  frame[1] = cmd;
-  frame[2] = aux1;
+  frame[1] = cmd;    // comando EXACTO del MASTER/Atari
+  frame[2] = aux1;   // se preservan
   frame[3] = aux2;
   frame[4] = sioChecksum(frame, 4);
 
@@ -544,6 +546,7 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
     return;
   }
 
+  // La XF551 devuelve 128 bytes de resultado
   uint8_t buf[SECTOR_128];
   if (!readFromDrive(buf, SECTOR_128, 60000)) {
     logf("[SLAVE D%u] FORMAT: fallo lectura bloque resultado",
@@ -552,6 +555,7 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
     return;
   }
 
+  // DEBUG: dump primeros 16 bytes
   Serial.printf("[SLAVE D%u] FORMAT resultado (primeros 16 bytes): ",
                 (unsigned)(dev - 0x30));
   for (int i = 0; i < 16; i++) {
@@ -562,6 +566,7 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
   }
   Serial.println();
 
+  // Invalida cache porque el disco cambió
   cacheCount = 0;
 
   sendACK();
@@ -569,6 +574,27 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
   logf("[SLAVE D%u] FORMAT cmd=0x%02X OK (128 bytes resultado)",
        (unsigned)(dev - 0x30), cmd);
 }
+
+// FORMAT SD (base 0x21)
+void handleFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
+  logf("[SLAVE D%u] FORMAT SD (base 0x21) solicitado por MASTER",
+       (unsigned)(dev - 0x30));
+  // Cancelamos operaciones pendientes
+  writePending        = false;
+  percomWritePending  = false;
+  formatXF(dev, cmd, aux1, aux2);
+}
+
+// FORMAT DD (base 0x22)
+void handleFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
+  logf("[SLAVE D%u] FORMAT DD (base 0x22) solicitado por MASTER",
+       (unsigned)(dev - 0x30));
+  writePending        = false;
+  percomWritePending  = false;
+  formatXF(dev, cmd, aux1, aux2);
+}
+
+
 
 void handleWriteFromMaster(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd) {
   writePending   = true;
@@ -742,16 +768,16 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
     }
 
     if (base == 0x53) {
-      handleStatusFromMaster(dev, dd);
+      handleStatusFromMaster(dev, aux1, aux2, dd);
       return;
     }
 
     if (base == 0x21) { // FORMAT SD
-      handleFormatFromMaster(dev, 0x21, aux1, aux2, dd);
+      handleFormatSD(dev, cmd, aux1, aux2);
       return;
     }
     if (base == 0x22) { // FORMAT ED
-      handleFormatFromMaster(dev, 0x22, aux1, aux2, dd);
+      handleFormatDD(dev, cmd, aux1, aux2);
       return;
     }
 

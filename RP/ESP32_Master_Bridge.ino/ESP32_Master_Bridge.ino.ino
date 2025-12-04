@@ -338,59 +338,56 @@ void pollUartFromRP() {
 
           switch (type) {
             case TYPE_CMD_FRAME: {
-              // Ajuste explícito de FORMAT / WRITE
-              if (uartLen >= 7) {
-                uint8_t cmd  = uartBuf[1];
-                uint8_t dev  = uartBuf[2];
-                uint8_t aux1 = uartBuf[3];
-                uint8_t aux2 = uartBuf[4];
-                uint8_t dens = uartBuf[5];
-                uint8_t pf   = uartBuf[6];
+  if (uartLen >= 7) {
+    uint8_t cmd  = uartBuf[1];
+    uint8_t dev  = uartBuf[2];
+    uint8_t base = cmd & 0x7F;
 
-                // Prefetch override
-                uint8_t pfCfg = prefetchForDev(dev);
-                if (pfCfg > MAX_PREFETCH_SECTORS) pfCfg = MAX_PREFETCH_SECTORS;
-                if (pfCfg > 0) {
-                  uartBuf[6] = pfCfg;
-                  logf("[MASTER] PREFETCH %s = %u sectores",
-                       devName(dev), pfCfg);
-                }
+    // Prefetch override
+    uint8_t pf  = prefetchForDev(dev);
+    if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
+    if (pf > 0) {
+      uartBuf[6] = pf;
+      logf("[MASTER] Overwrite PREFETCH para %s = %u sectores",
+           devName(dev), pf);
+    }
 
-                bool isWriteSector = (cmd == 0x50 || cmd == 0x57);
-                bool isWritePercom = (cmd == 0x4F);
-                bool isFormatSD    = (cmd == 0x21);
-                bool isFormatED    = (cmd == 0x22);
+    // Log específico de FORMAT
+    if (base == 0x21) {
+      logf("[MASTER] FORMAT SD (0x21) dev=%s", devName(dev));
+    } else if (base == 0x22) {
+      logf("[MASTER] FORMAT DD (0x22) dev=%s", devName(dev));
+    }
 
-                if (isWriteSector || isWritePercom) {
-                  uint16_t sec;
-                  if (isWritePercom) {
-                    sec = 0xFFFF;
-                  } else {
-                    sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
-                  }
+    // Detectar WRITE pendiente
+    bool isWriteSector = (base == 0x50 || base == 0x57);
+    bool isWritePercom = (base == 0x4F);
 
-                  g_pendingWriteRP.active = true;
-                  g_pendingWriteRP.dev    = dev;
-                  g_pendingWriteRP.sec    = sec;
-                  logf("[MASTER] WRITE pendiente dev=%s sec=%u cmd=0x%02X",
-                       devName(dev), (unsigned)sec, (unsigned)cmd);
-                }
+    if (isWriteSector || isWritePercom) {
+      uint16_t sec;
+      if (isWritePercom) {
+        sec = 0xFFFF;
+      } else {
+        sec = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
+      }
 
-                if (isFormatSD || isFormatED) {
-                  logf("[MASTER] FORMAT %s para %s aux1=0x%02X aux2=0x%02X dens=%u",
-                       isFormatED ? "ED(0x22)" : "SD(0x21)",
-                       devName(dev), aux1, aux2, dens);
-                }
-              }
+      g_pendingWriteRP.active = true;
+      g_pendingWriteRP.dev    = dev;
+      g_pendingWriteRP.sec    = sec;
+      logf("[MASTER] WRITE pendiente desde RP dev=%s sec=%u base=0x%02X",
+           devName(dev), (unsigned)sec, (unsigned)base);
+    }
+  }
 
-              // Comando desde RP -> reenviar al SLAVE
-              sendEspToSlave(uartBuf, uartLen);
-              Serial.print(F("[MASTER] Enviado payload a SLAVE tipo=0x"));
-              if (uartBuf[0] < 0x10) Serial.print('0');
-              Serial.print(uartBuf[0], HEX);
-              Serial.print(F(" len="));
-              Serial.println(uartLen);
-            } break;
+  // Reenviar comando al SLAVE
+  sendEspToSlave(uartBuf, uartLen);
+  Serial.print(F("[MASTER] Enviado payload a SLAVE tipo=0x"));
+  if (uartBuf[0] < 0x10) Serial.print('0');
+  Serial.print(uartBuf[0], HEX);
+  Serial.print(F(" len="));
+  Serial.println(uartLen);
+} break;
+
 
             case TYPE_SECTOR_CHUNK: {
               if (uartLen < 6) {
