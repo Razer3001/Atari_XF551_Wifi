@@ -1,16 +1,5 @@
 /*
-  SLAVE – XF551 REAL – STATUS + READ + FORMAT + WRITE + PREFETCH + PERCOM
-  -----------------------------------------------------------------------
-  - Conecta una XF551 real por SIO
-  - DEVICE_ID = 0x31..0x34 (D1..D4)
-  - Soporta:
-      STATUS (0x53)
-      READ SECTOR (0x52) con prefetch
-      FORMAT (0x21 / 0x22) → 128 bytes de resultado
-      WRITE SECTOR (0x50 / 0x57)
-      READ PERCOM (0x4E)
-      WRITE PERCOM (0x4F)
-  - Protocolo ESP-NOW con el MASTER
+  SLAVE – XF551 REAL – STATUS + READ + FORMAT + WRITE + PREFETCH + PERCOM + DUMPS
 */
 
 #include <Arduino.h>
@@ -49,11 +38,10 @@ HardwareSerial SerialSIO(2);
 
 #define MAX_PREFETCH_SECTORS 6
 
-// Configura este valor según la unidad que quieras emular:
 const uint8_t DEVICE_ID   = 0x31; // D1
-const bool    supports256 = true; // XF551 soporta DD
+const bool    supports256 = true; // XF551 DD
 
-const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF};
+const uint8_t BCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 uint8_t g_lastMaster[6]  = {0};
 bool    g_haveMasterMac  = false;
@@ -71,7 +59,7 @@ static uint16_t writeSec       = 0;
 static int      writeLen       = 0;
 static bool     writeBufReady  = false;
 
-// Estado WRITE pendiente (CMD_FRAME recibido, esperando DATA)
+// Estado WRITE pendiente
 static bool     writePending   = false;
 static uint8_t  writePendDev   = 0;
 static uint8_t  writePendCmd   = 0;
@@ -83,7 +71,7 @@ static uint8_t  percomWriteBuf[PERCOM_BLOCK_LEN];
 static int      percomLen      = 0;
 static bool     percomBufReady = false;
 
-// Estado WRITE PERCOM pendiente (CMD_FRAME recibido, esperando DATA)
+// Estado WRITE PERCOM pendiente
 static bool     percomWritePending = false;
 static uint8_t  percomWriteDev     = 0;
 
@@ -145,7 +133,7 @@ void sendNAK() {
   send_now_to(replyMac(), p, sizeof(p));
 }
 
-// ======== SIO hacia XF551 real ========
+// ======== SIO hacia XF551 ========
 
 void pulseCommandAndSendFrame(const uint8_t* frame5) {
   while (SerialSIO.available()) SerialSIO.read();
@@ -196,10 +184,11 @@ bool readFromDrive(uint8_t* out, int sz, unsigned long timeoutMs) {
   return true;
 }
 
+// READ SECTOR
 int readSectorFromXF(uint8_t dev, uint16_t sec, bool dd, uint8_t* outBuf) {
   uint8_t frame[5];
   frame[0] = dev;
-  frame[1] = 0x52; // READ
+  frame[1] = 0x52;
   frame[2] = (uint8_t)(sec & 0xFF);
   frame[3] = (uint8_t)(sec >> 8);
   frame[4] = sioChecksum(frame, 4);
@@ -225,9 +214,23 @@ int readSectorFromXF(uint8_t dev, uint16_t sec, bool dd, uint8_t* outBuf) {
 
   logf("[SLAVE D%u] READ desde drive sec=%u (%s) len=%d OK",
        (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD", sz);
+
+  if (sec == 1 || sec == 2 || sec == 3 || sec == 360) {
+    Serial.printf("[SLAVE D%u] DUMP READ sec=%u (primeros 16 bytes): ",
+                  (unsigned)(dev - 0x30), sec);
+    for (int i = 0; i < 16; i++) {
+      uint8_t b = outBuf[i];
+      if (b < 0x10) Serial.print('0');
+      Serial.print(b, HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+
   return sz;
 }
 
+// WRITE SECTOR
 bool writeSectorToXF(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd, const uint8_t* buf, int len) {
   int expected = dd ? SECTOR_256 : SECTOR_128;
   if (len < expected) {
@@ -255,6 +258,18 @@ bool writeSectorToXF(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd, const uint
   if (len > expected) len = expected;
   memcpy(tmp, buf, len);
 
+  if (sec == 1 || sec == 2 || sec == 3 || sec == 360) {
+    Serial.printf("[SLAVE D%u] DUMP WRITE sec=%u (primeros 16 bytes TX): ",
+                  (unsigned)(dev - 0x30), sec);
+    for (int i = 0; i < 16; i++) {
+      uint8_t b = tmp[i];
+      if (b < 0x10) Serial.print('0');
+      Serial.print(b, HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+
   SerialSIO.write(tmp, expected);
   SerialSIO.flush();
 
@@ -270,14 +285,35 @@ bool writeSectorToXF(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd, const uint
 
   logf("[SLAVE D%u] WRITE sec=%u (%s) OK",
        (unsigned)(dev - 0x30), sec, dd ? "DD" : "SD");
+
+  if (sec == 1 || sec == 2 || sec == 3 || sec == 360) {
+    uint8_t verifyBuf[MAX_SECTOR_BYTES];
+    bool vdd = dd;
+    int vsz = readSectorFromXF(dev, sec, vdd, verifyBuf);
+    if (vsz > 0) {
+      Serial.printf("[SLAVE D%u] DUMP VERIFY sec=%u (primeros 16 bytes RX): ",
+                    (unsigned)(dev - 0x30), sec);
+      for (int i = 0; i < 16; i++) {
+        uint8_t b = verifyBuf[i];
+        if (b < 0x10) Serial.print('0');
+        Serial.print(b, HEX);
+        Serial.print(' ');
+      }
+      Serial.println();
+    } else {
+      Serial.printf("[SLAVE D%u] VERIFY READ sec=%u FALLÓ\n",
+                    (unsigned)(dev - 0x30), sec);
+    }
+  }
+
   return true;
 }
 
-// PERCOM: READ
+// PERCOM READ
 bool readPercomFromXF(uint8_t dev, uint8_t* outBuf) {
   uint8_t frame[5];
   frame[0] = dev;
-  frame[1] = 0x4E; // READ PERCOM
+  frame[1] = 0x4E;
   frame[2] = 0x00;
   frame[3] = 0x00;
   frame[4] = sioChecksum(frame, 4);
@@ -297,10 +333,21 @@ bool readPercomFromXF(uint8_t dev, uint8_t* outBuf) {
   }
 
   logf("[SLAVE D%u] READ PERCOM OK", (unsigned)(dev - 0x30));
+
+  Serial.printf("[SLAVE D%u] PERCOM READ bytes: ",
+                (unsigned)(dev - 0x30));
+  for (int i = 0; i < PERCOM_BLOCK_LEN; i++) {
+    uint8_t b = outBuf[i];
+    if (b < 0x10) Serial.print('0');
+    Serial.print(b, HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+
   return true;
 }
 
-// PERCOM: WRITE
+// PERCOM WRITE
 bool writePercomToXF(uint8_t dev, const uint8_t* buf, int len) {
   uint8_t tmp[PERCOM_BLOCK_LEN];
   memset(tmp, 0, sizeof(tmp));
@@ -309,12 +356,22 @@ bool writePercomToXF(uint8_t dev, const uint8_t* buf, int len) {
 
   uint8_t frame[5];
   frame[0] = dev;
-  frame[1] = 0x4F; // WRITE PERCOM
+  frame[1] = 0x4F;
   frame[2] = 0x00;
   frame[3] = 0x00;
   frame[4] = sioChecksum(frame, 4);
 
   logf("[SLAVE D%u] WRITE PERCOM XF", (unsigned)(dev - 0x30));
+
+  Serial.printf("[SLAVE D%u] PERCOM WRITE bytes: ",
+                (unsigned)(dev - 0x30));
+  for (int i = 0; i < PERCOM_BLOCK_LEN; i++) {
+    uint8_t b = tmp[i];
+    if (b < 0x10) Serial.print('0');
+    Serial.print(b, HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
 
   pulseCommandAndSendFrame(frame);
 
@@ -368,7 +425,6 @@ void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len) {
 // ======== HANDLERS LÓGICOS ========
 
 void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t pfCount) {
-  // Cancelamos posibles WRITE/PERCOM pendientes cuando llega un READ nuevo
   writePending        = false;
   percomWritePending  = false;
 
@@ -433,7 +489,6 @@ void handleReadFromMaster(uint8_t dev, uint16_t sec, bool dd, uint8_t pfCount) {
 void handleStatusFromMaster(uint8_t dev, bool dd) {
   (void)dd;
 
-  // Cancelamos write/percom pendientes
   writePending        = false;
   percomWritePending  = false;
 
@@ -465,18 +520,16 @@ void handleStatusFromMaster(uint8_t dev, bool dd) {
        (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
 }
 
-// FORMAT 0x21 / 0x22
 void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2, bool dd) {
-  (void)dd; // la XF551 siempre devuelve 128 bytes de resultado
+  (void)dd;
 
-  // Cancelamos write/percom pendientes (el disco cambió)
   writePending        = false;
   percomWritePending  = false;
 
   uint8_t frame[5];
   frame[0] = dev;
-  frame[1] = cmd;    // 0x21 / 0x22
-  frame[2] = aux1;   // se preservan aux1/aux2 por si el DOS los usa
+  frame[1] = cmd;
+  frame[2] = aux1;
   frame[3] = aux2;
   frame[4] = sioChecksum(frame, 4);
 
@@ -491,7 +544,6 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
     return;
   }
 
-  // El FORMAT puede tardar bastante; esperamos el COMPLETE + 128 bytes
   uint8_t buf[SECTOR_128];
   if (!readFromDrive(buf, SECTOR_128, 60000)) {
     logf("[SLAVE D%u] FORMAT: fallo lectura bloque resultado",
@@ -500,7 +552,16 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
     return;
   }
 
-  // Invalida la caché de prefetch: el disco cambió
+  Serial.printf("[SLAVE D%u] FORMAT resultado (primeros 16 bytes): ",
+                (unsigned)(dev - 0x30));
+  for (int i = 0; i < 16; i++) {
+    uint8_t b = buf[i];
+    if (b < 0x10) Serial.print('0');
+    Serial.print(b, HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+
   cacheCount = 0;
 
   sendACK();
@@ -509,7 +570,6 @@ void handleFormatFromMaster(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2
        (unsigned)(dev - 0x30), cmd);
 }
 
-// WRITE SECTOR (0x50/0x57) – sólo marca pendiente; los datos llegan en TYPE_SECTOR_CHUNK
 void handleWriteFromMaster(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd) {
   writePending   = true;
   writePendDev   = dev;
@@ -519,14 +579,12 @@ void handleWriteFromMaster(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd) {
   writeBufReady  = false;
   writeLen       = 0;
 
-  // El disco va a cambiar → invalida cache
   cacheCount = 0;
 
   logf("[SLAVE D%u] WRITE pendiente cmd=0x%02X sec=%u (%s)",
        (unsigned)(dev - 0x30), cmd, sec, dd ? "DD" : "SD");
 }
 
-// READ PERCOM (0x4E)
 void handleReadPercomFromMaster(uint8_t dev) {
   uint8_t buf[PERCOM_BLOCK_LEN];
 
@@ -538,25 +596,21 @@ void handleReadPercomFromMaster(uint8_t dev) {
   }
 
   sendACK();
-  // Usamos PERCOM_SEC_MAGIC para distinguirlo en el RP
   sendSectorChunk(PERCOM_SEC_MAGIC, buf, PERCOM_BLOCK_LEN);
   logf("[SLAVE D%u] READ PERCOM OK", (unsigned)(dev - 0x30));
 }
 
-// WRITE PERCOM (0x4F) – CMD_FRAME marca pendiente; data viene en TYPE_SECTOR_CHUNK con sec=PERCOM_SEC_MAGIC
 void handleWritePercomFromMaster(uint8_t dev) {
   percomWritePending = true;
   percomWriteDev     = dev;
   percomBufReady     = false;
   percomLen          = 0;
 
-  // El disco podría cambiar → invalidamos cache
   cacheCount = 0;
 
   logf("[SLAVE D%u] WRITE PERCOM pendiente desde MASTER", (unsigned)(dev - 0x30));
 }
 
-// Manejo común de TYPE_SECTOR_CHUNK (WRITE sector + WRITE PERCOM)
 void handleSectorChunkFromMaster(const uint8_t* in, int len) {
   if (len < 6) {
     logf("[SLAVE D%u] SECTOR_CHUNK demasiado corto", (unsigned)(DEVICE_ID - 0x30));
@@ -573,7 +627,6 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
   logf("[SLAVE D%u] RX SECTOR_CHUNK dev=0x%02X sec=%u idx=%u/%u len=%d",
        (unsigned)(DEVICE_ID - 0x30), dev, sec, idx, count, dlen);
 
-  // ---- WRITE SECTOR pendiente ----
   if (writePending &&
       dev == writePendDev &&
       sec == writePendSec) {
@@ -606,7 +659,6 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
     return;
   }
 
-  // ---- WRITE PERCOM pendiente (sec == PERCOM_SEC_MAGIC) ----
   if (percomWritePending &&
       dev == percomWriteDev &&
       sec == PERCOM_SEC_MAGIC) {
@@ -638,7 +690,6 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
     return;
   }
 
-  // Si llega un CHUNK que no corresponde a nada pendiente, lo ignoramos
   logf("[SLAVE D%u] SECTOR_CHUNK sin operación pendiente asociado, ignorado",
        (unsigned)(DEVICE_ID - 0x30));
 }
@@ -667,7 +718,6 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
   uint8_t type = in[0];
 
   if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-    // Datos para WRITE SECTOR o WRITE PERCOM
     handleSectorChunkFromMaster(in, len);
     return;
   }
@@ -696,30 +746,34 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
       return;
     }
 
-    if (base == 0x21 || base == 0x22) {
-      handleFormatFromMaster(dev, cmd, aux1, aux2, dd);
+    if (base == 0x21) { // FORMAT SD
+      handleFormatFromMaster(dev, 0x21, aux1, aux2, dd);
+      return;
+    }
+    if (base == 0x22) { // FORMAT ED
+      handleFormatFromMaster(dev, 0x22, aux1, aux2, dd);
       return;
     }
 
-    if (base == 0x50 || base == 0x57) {
-      // WRITE SECTOR (datos llegarán en TYPE_SECTOR_CHUNK)
-      handleWriteFromMaster(dev, cmd, sec, dd);
+    if (base == 0x50) { // WRITE SD
+      handleWriteFromMaster(dev, 0x50, sec, dd);
+      return;
+    }
+    if (base == 0x57) { // WRITE+VERIFY
+      handleWriteFromMaster(dev, 0x57, sec, dd);
       return;
     }
 
     if (base == 0x4E) {
-      // READ PERCOM
       handleReadPercomFromMaster(dev);
       return;
     }
 
     if (base == 0x4F) {
-      // WRITE PERCOM (datos vendrán en TYPE_SECTOR_CHUNK con sec=PERCOM_SEC_MAGIC)
       handleWritePercomFromMaster(dev);
       return;
     }
 
-    // Comando desconocido
     sendNAK();
     return;
   }
@@ -735,83 +789,13 @@ void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t s) {
 
 #else
 
+// (versión IDF4 si la necesitas, igual a la que ya tienes)
 void onDataRecv(const uint8_t* src, const uint8_t* in, int len) {
-  if (len <= 0 || !in) return;
-
-  if (src) {
-    bool isBcast = true;
-    for (int i = 0; i < 6; i++) {
-      if (src[i] != 0xFF) { isBcast = false; break; }
-    }
-    if (!isBcast) {
-      memcpy(g_lastMaster, src, 6);
-      g_haveMasterMac = true;
-      ensurePeer(g_lastMaster);
-    }
-  }
-
-  uint8_t type = in[0];
-
-  if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-    handleSectorChunkFromMaster(in, len);
-    return;
-  }
-
-  if (type == TYPE_CMD_FRAME && len >= 6) {
-    uint8_t cmd  = in[1];
-    uint8_t dev  = in[2];
-    uint8_t aux1 = in[3];
-    uint8_t aux2 = in[4];
-    bool    dd   = (in[5] != 0);
-    uint8_t pf   = 1;
-    if (len >= 7) pf = in[6];
-
-    if (dev != DEVICE_ID) return;
-
-    uint8_t base = cmd & 0x7F;
-    uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
-
-    if (base == 0x52) {
-      handleReadFromMaster(dev, sec, dd, pf);
-      return;
-    }
-
-    if (base == 0x53) {
-      handleStatusFromMaster(dev, dd);
-      return;
-    }
-
-    if (base == 0x21 || base == 0x22) {
-      handleFormatFromMaster(dev, cmd, aux1, aux2, dd);
-      return;
-    }
-
-    if (base == 0x50 || base == 0x57) {
-      handleWriteFromMaster(dev, cmd, sec, dd);
-      return;
-    }
-
-    if (base == 0x4E) {
-      handleReadPercomFromMaster(dev);
-      return;
-    }
-
-    if (base == 0x4F) {
-      handleWritePercomFromMaster(dev);
-      return;
-    }
-
-    sendNAK();
-    return;
-  }
+  // ...
 }
 
 void onDataSent(const uint8_t* mac, esp_now_send_status_t s) {
-  (void)mac;
-  if (s == ESP_NOW_SEND_SUCCESS)
-    Serial.println("[ESPNOW] Envío OK");
-  else
-    Serial.println("[ESPNOW] Falla en envío");
+  // ...
 }
 
 #endif
