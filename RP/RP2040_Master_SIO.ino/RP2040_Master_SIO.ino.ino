@@ -106,7 +106,7 @@ bool     g_writeSuccess    = false;
 uint16_t g_writeSec        = 0;
 
 // ================== HACK OPCIONAL DE STATUS POST-FORMAT ==================
-// (por ahora desactivado; lo activaremos cuando tengamos los 4 bytes “buenos”
+// (por ahora desactivado; se puede habilitar a mano)
 bool    g_enableStatusHack = false;   // pon a true para probar el hack
 uint8_t g_statusHackAux1   = 0x21;    // el AUX1 del STATUS post-FORMAT
 uint8_t g_statusHackData[4] = {
@@ -210,9 +210,9 @@ void uartSendFrame(uint8_t type, const uint8_t *payload, uint8_t payloadLen) {
 bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2);
 bool doRemoteRead(uint8_t dev, uint16_t sec);
 
-// ==== FORMAT SEPARADO ====
+// FORMAT SEPARADO
 bool doRemoteFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);
-bool doRemoteFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);  // CMD 0x22
+bool doRemoteFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2);
 
 bool doRemotePercomRead(uint8_t dev);
 bool doRemotePercomWrite(uint8_t dev, const uint8_t *data);
@@ -236,7 +236,6 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
 
     case TYPE_ACK: {
       Serial.println(F("[RP2040] ACK desde SLAVE (MASTER)"));
-      // Para WRITE (sector o PERCOM), el ACK indica que la operación fue correcta
       if (g_currentOp == OP_WRITE) {
         g_writeDone    = true;
         g_writeSuccess = true;
@@ -488,12 +487,11 @@ void sendAtariData(const uint8_t *buf, int len) {
 
 // ================== Operaciones remotas ==================
 
-// ***** STATUS remoto: ahora sabe aux1/aux2 y logea + hack opcional *****
+// STATUS remoto: ahora sabe aux1/aux2 y logea + hack opcional
 bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
   uint8_t payload[6];
   payload[0] = 0x53;      // CMD STATUS
   payload[1] = dev;
-  // *** AHORA SÍ propagamos AUX1/AUX2 ***
   payload[2] = aux1;
   payload[3] = aux2;
   payload[4] = 0;         // densFlag (no aplica a STATUS)
@@ -518,7 +516,6 @@ bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
     return false;
   }
 
-  // Log STATUS con AUX1/AUX2 reales
   Serial.print(F("[RP2040] STATUS remoto bruto dev=0x"));
   if (dev < 0x10) Serial.print('0');
   Serial.print(dev, HEX);
@@ -536,7 +533,6 @@ bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
   }
   Serial.println();
 
-  // Hack opcional sigue igual...
   if (g_enableStatusHack && aux1 == g_statusHackAux1) {
     Serial.println(F("[RP2040] STATUS HACK activo, sobrescribiendo bytes de STATUS..."));
     for (int i = 0; i < 4; i++) {
@@ -548,7 +544,6 @@ bool doRemoteStatus(uint8_t dev, uint8_t aux1, uint8_t aux2) {
   sendAtariData(g_statusData, 4);
   return true;
 }
-
 
 bool doRemoteRead(uint8_t dev, uint16_t sec) {
   uint8_t payload[6];
@@ -590,13 +585,12 @@ bool doRemoteRead(uint8_t dev, uint16_t sec) {
   return true;
 }
 
-// FORMAT remoto (0x21 / 0x22)
-// === Helper común interno para FORMAT (como tu doRemoteFormat original) ===
+// FORMAT remoto (0x21 / 0x22) – helper común
 static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   uint8_t payload[6];
-  payload[0] = cmd;       // OJO: comando EXACTO del Atari (puede ser 0x21, 0x22, 0xA1, etc.)
+  payload[0] = cmd;       // comando EXACTO del Atari (0x21, 0x22, 0xA1, 0xA2, etc.)
   payload[1] = dev;
-  payload[2] = aux1;      // se preservan aux1/aux2 tal como llegan del Atari
+  payload[2] = aux1;      // se preservan tal cual
   payload[3] = aux2;
 
   uint8_t base = (cmd & 0x7F);
@@ -656,7 +650,7 @@ static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t
   return true;
 }
 
-// FORMAT SD (base 0x21, pero respeta cmd original: 0x21 o 0xA1)
+// FORMAT SD (base 0x21, respeta cmd original: 0x21 o 0xA1)
 bool doRemoteFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   Serial.println(F("[RP2040] FORMAT SD (base 0x21) solicitado"));
   return doRemoteFormatCommon(dev, cmd, aux1, aux2);
@@ -667,8 +661,6 @@ bool doRemoteFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   Serial.println(F("[RP2040] FORMAT DD (base 0x22) solicitado"));
   return doRemoteFormatCommon(dev, cmd, aux1, aux2);
 }
-
-
 
 // READ PERCOM (0x4E)
 bool doRemotePercomRead(uint8_t dev) {
@@ -704,7 +696,7 @@ bool doRemotePercomRead(uint8_t dev) {
   return true;
 }
 
-// WRITE PERCOM (0x4F) – nuevo
+// WRITE PERCOM (0x4F)
 bool doRemotePercomWrite(uint8_t dev, const uint8_t *data) {
   uint8_t payload[6];
   payload[0] = 0x4F;                        // CMD WRITE PERCOM
@@ -751,6 +743,8 @@ bool doRemotePercomWrite(uint8_t dev, const uint8_t *data) {
 
 // WRITE SECTOR (0x50 / 0x57)
 bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_t *data, int len) {
+  (void)dd; // por ahora no usamos densFlag desde RP
+
   uint8_t payload[6];
 
   // normalizamos 0x57 → 0x50 para el MASTER/SLAVE
@@ -815,22 +809,23 @@ bool doRemoteWrite(uint8_t dev, uint16_t sec, uint8_t cmd, bool dd, const uint8_
 // ================== SIO: lectura del frame ==================
 
 bool readSioCommandFrame(uint8_t buf[5]) {
-  // Timeout más relajado por byte de comando (antes 5 ms)
-  const uint16_t CMD_BYTE_TIMEOUT_MS = 20;
-
   for (int i = 0; i < 5; i++) {
-    if (!readByteWithTimeoutSIO(buf[i], CMD_BYTE_TIMEOUT_MS)) {
+    if (!readByteWithTimeoutSIO(buf[i], 5)) {
       Serial.print(F("[SIO] Timeout leyendo byte "));
       Serial.println(i);
+
+      // Aquí SÍ drenas, porque sabes que quedaste desfasado
+      unsigned long t0 = millis();
+      while (SerialSIO.available() > 0 && (millis() - t0) < 2) {
+        (void)SerialSIO.read();
+      }
+
       return false;
     }
   }
   dumpCommandFrame(buf);
   return true;
 }
-
-
-
 
 // ================== Manejo del comando SIO ==================
 
@@ -860,7 +855,6 @@ void handleSioCommand() {
     SerialSIO.flush();
     Serial.println(F("[SIO] ACK enviado (STATUS)"));
     delayMicroseconds(800);
-    // *** ahora STATUS sabe aux1/aux2 ***
     doRemoteStatus(dev, aux1, aux2);
     return;
   }
@@ -875,7 +869,7 @@ void handleSioCommand() {
     return;
   }
 
-  // WRITE PERCOM (0x4F) – NUEVO
+  // WRITE PERCOM (0x4F)
   if (base == 0x4F) {
     uint8_t percom[PERCOM_BLOCK_LEN];
 
@@ -883,7 +877,6 @@ void handleSioCommand() {
     SerialSIO.flush();
     Serial.println(F("[SIO] ACK enviado (WRITE PERCOM)"));
 
-    // pequeña pausa antes de recibir los datos
     delayMicroseconds(800);
 
     // Leer los 12 bytes de PERCOM
@@ -933,7 +926,6 @@ void handleSioCommand() {
 
     // Enviar WRITE PERCOM remoto a MASTER/SLAVE
     if (doRemotePercomWrite(dev, percom)) {
-      // Si todo OK, devolvemos COMPLETE al Atari (sin data)
       delayMicroseconds(T_ACK_TO_COMPLETE);
       SerialSIO.write(SIO_COMPLETE);
       SerialSIO.flush();
@@ -959,49 +951,49 @@ void handleSioCommand() {
   }
 
   // FORMAT (0x21 / 0x22)
+
   // FORMAT SD (0x21 base)
-if (base == 0x21) {
-  SerialSIO.write(SIO_ACK);
-  SerialSIO.flush();
-  Serial.print(F("[SIO] ACK enviado (FORMAT SD cmd=0x"));
-  if (cmd < 0x10) Serial.print('0');
-  Serial.print(cmd, HEX);
-  Serial.print(F(") aux1=0x"));
-  if (aux1 < 0x10) Serial.print('0');
-  Serial.print(aux1, HEX);
-  Serial.print(F(" aux2=0x"));
-  if (aux2 < 0x10) Serial.print('0');
-  Serial.println(aux2, HEX);
+  if (base == 0x21) {
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.print(F("[SIO] ACK enviado (FORMAT SD cmd=0x"));
+    if (cmd < 0x10) Serial.print('0');
+    Serial.print(cmd, HEX);
+    Serial.print(F(") aux1=0x"));
+    if (aux1 < 0x10) Serial.print('0');
+    Serial.print(aux1, HEX);
+    Serial.print(F(" aux2=0x"));
+    if (aux2 < 0x10) Serial.print('0');
+    Serial.println(aux2, HEX);
 
-  delayMicroseconds(800);
-  doRemoteFormatSD(dev, cmd, aux1, aux2);  // OJO: pasa cmd completo
-  return;
-}
+    delayMicroseconds(800);
+    doRemoteFormatSD(dev, cmd, aux1, aux2);
+    return;
+  }
 
-// FORMAT DD (0x22 base)
-if (base == 0x22) {
-  SerialSIO.write(SIO_ACK);
-  SerialSIO.flush();
-  Serial.print(F("[SIO] ACK enviado (FORMAT DD cmd=0x"));
-  if (cmd < 0x10) Serial.print('0');
-  Serial.print(cmd, HEX);
-  Serial.print(F(") aux1=0x"));
-  if (aux1 < 0x10) Serial.print('0');
-  Serial.print(aux1, HEX);
-  Serial.print(F(" aux2=0x"));
-  if (aux2 < 0x10) Serial.print('0');
-  Serial.println(aux2, HEX);
+  // FORMAT DD (0x22 base)
+  if (base == 0x22) {
+    SerialSIO.write(SIO_ACK);
+    SerialSIO.flush();
+    Serial.print(F("[SIO] ACK enviado (FORMAT DD cmd=0x"));
+    if (cmd < 0x10) Serial.print('0');
+    Serial.print(cmd, HEX);
+    Serial.print(F(") aux1=0x"));
+    if (aux1 < 0x10) Serial.print('0');
+    Serial.print(aux1, HEX);
+    Serial.print(F(" aux2=0x"));
+    if (aux2 < 0x10) Serial.print('0');
+    Serial.println(aux2, HEX);
 
-  delayMicroseconds(800);
-  doRemoteFormatDD(dev, cmd, aux1, aux2);  // OJO: pasa cmd completo
-  return;
-}
-
-
+    delayMicroseconds(800);
+    doRemoteFormatDD(dev, cmd, aux1, aux2);
+    return;
+  }
 
   // WRITE SECTOR (0x50 / 0x57)
   if (base == 0x50 || base == 0x57) {
-    bool isVerify   = (base == 0x57);   // por si más adelante quieres usarlo
+    bool isVerify   = (base == 0x57);
+    (void)isVerify;
     int expectedLen = 128;              // por ahora siempre 128 (SD)
 
     uint8_t dataBuf[256];
@@ -1014,7 +1006,6 @@ if (base == 0x22) {
     Serial.print(F(") sec="));
     Serial.println(sec);
 
-    // Pequeña pausa antes de recibir los datos
     delayMicroseconds(800);
 
     // Leer los datos desde el Atari
@@ -1066,7 +1057,6 @@ if (base == 0x22) {
 
     // Enviar WRITE remoto a MASTER/ESCLAVO
     if (doRemoteWrite(dev, sec, cmd, false, dataBuf, expectedLen)) {
-      // Si todo OK, devolvemos COMPLETE al Atari
       delayMicroseconds(T_ACK_TO_COMPLETE);
       SerialSIO.write(SIO_COMPLETE);
       SerialSIO.flush();

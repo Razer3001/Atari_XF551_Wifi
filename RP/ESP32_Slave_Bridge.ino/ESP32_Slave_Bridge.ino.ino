@@ -1,13 +1,13 @@
-/*
-  SLAVE – XF551 REAL – STATUS + READ + FORMAT + WRITE + PREFETCH + PERCOM + DUMPS
-*/
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
 #include <stdarg.h>
+
+#ifndef ESP_IDF_VERSION_MAJOR
+#define ESP_IDF_VERSION_MAJOR 4
+#endif
 
 // ======== SIO hacia XF551 ========
 #define SIO_RX      16 // desde XF551
@@ -496,7 +496,6 @@ void handleStatusFromMaster(uint8_t dev, uint8_t aux1, uint8_t aux2, bool dd) {
   uint8_t frame[5];
   frame[0] = dev;
   frame[1] = 0x53;
-  // *** aquí SÍ usamos aux1/aux2 tal como los mandó el Atari ***
   frame[2] = aux1;
   frame[3] = aux2;
   frame[4] = sioChecksum(frame, 4);
@@ -525,13 +524,12 @@ void handleStatusFromMaster(uint8_t dev, uint8_t aux1, uint8_t aux2, bool dd) {
        (unsigned)(dev - 0x30), st[0], st[1], st[2], st[3]);
 }
 
-
-// Helper común para FORMAT (ya lo tienes como formatXF)
+// Helper común para FORMAT
 static void formatXF(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   uint8_t frame[5];
   frame[0] = dev;
-  frame[1] = cmd;    // comando EXACTO del MASTER/Atari
-  frame[2] = aux1;   // se preservan
+  frame[1] = cmd;    // comando EXACTO que vino del RP/Atari
+  frame[2] = aux1;
   frame[3] = aux2;
   frame[4] = sioChecksum(frame, 4);
 
@@ -579,7 +577,6 @@ static void formatXF(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
 void handleFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   logf("[SLAVE D%u] FORMAT SD (base 0x21) solicitado por MASTER",
        (unsigned)(dev - 0x30));
-  // Cancelamos operaciones pendientes
   writePending        = false;
   percomWritePending  = false;
   formatXF(dev, cmd, aux1, aux2);
@@ -593,8 +590,6 @@ void handleFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   percomWritePending  = false;
   formatXF(dev, cmd, aux1, aux2);
 }
-
-
 
 void handleWriteFromMaster(uint8_t dev, uint8_t cmd, uint16_t sec, bool dd) {
   writePending   = true;
@@ -776,7 +771,7 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* in, int len) {
       handleFormatSD(dev, cmd, aux1, aux2);
       return;
     }
-    if (base == 0x22) { // FORMAT ED
+    if (base == 0x22) { // FORMAT DD
       handleFormatDD(dev, cmd, aux1, aux2);
       return;
     }
@@ -815,13 +810,79 @@ void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t s) {
 
 #else
 
-// (versión IDF4 si la necesitas, igual a la que ya tienes)
 void onDataRecv(const uint8_t* src, const uint8_t* in, int len) {
-  // ...
+  (void)src;
+  if (len <= 0 || !in) return;
+  uint8_t type = in[0];
+
+  if (type == TYPE_SECTOR_CHUNK && len >= 6) {
+    handleSectorChunkFromMaster(in, len);
+    return;
+  }
+
+  if (type == TYPE_CMD_FRAME && len >= 6) {
+    uint8_t cmd  = in[1];
+    uint8_t dev  = in[2];
+    uint8_t aux1 = in[3];
+    uint8_t aux2 = in[4];
+    bool    dd   = (in[5] != 0);
+    uint8_t pf   = 1;
+    if (len >= 7) pf = in[6];
+
+    if (dev != DEVICE_ID) return;
+
+    uint8_t base = cmd & 0x7F;
+    uint16_t sec = (uint16_t)aux1 | ((uint16_t)aux2 << 8);
+
+    if (base == 0x52) {
+      handleReadFromMaster(dev, sec, dd, pf);
+      return;
+    }
+
+    if (base == 0x53) {
+      handleStatusFromMaster(dev, aux1, aux2, dd);
+      return;
+    }
+
+    if (base == 0x21) { // FORMAT SD
+      handleFormatSD(dev, cmd, aux1, aux2);
+      return;
+    }
+    if (base == 0x22) { // FORMAT DD
+      handleFormatDD(dev, cmd, aux1, aux2);
+      return;
+    }
+
+    if (base == 0x50) { // WRITE SD
+      handleWriteFromMaster(dev, 0x50, sec, dd);
+      return;
+    }
+    if (base == 0x57) { // WRITE+VERIFY
+      handleWriteFromMaster(dev, 0x57, sec, dd);
+      return;
+    }
+
+    if (base == 0x4E) {
+      handleReadPercomFromMaster(dev);
+      return;
+    }
+
+    if (base == 0x4F) {
+      handleWritePercomFromMaster(dev);
+      return;
+    }
+
+    sendNAK();
+    return;
+  }
 }
 
 void onDataSent(const uint8_t* mac, esp_now_send_status_t s) {
-  // ...
+  (void)mac;
+  if (s == ESP_NOW_SEND_SUCCESS)
+    Serial.println("[ESPNOW] Envío OK");
+  else
+    Serial.println("[ESPNOW] Falla en envío");
 }
 
 #endif

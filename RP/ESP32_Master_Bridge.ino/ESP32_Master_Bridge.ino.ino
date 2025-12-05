@@ -1,21 +1,3 @@
-/*
-  ESP32 MASTER BRIDGE + WEB UI
-  ----------------------------
-  - Recibe frames binarios por Serial2 desde el RP2040:
-      UART_SYNC(0x55) + LEN + PAYLOAD + CHK
-  - PAYLOAD[0] = tipo (0x01, 0x10, 0x11, 0x12, 0x20)
-  - Reenvía por ESP-NOW hacia el SLAVE:
-      * TYPE_CMD_FRAME (0x01) -> SLAVE (XF551)
-  - Recibe desde SLAVE por ESP-NOW:
-      * TYPE_HELLO (0x20)
-      * TYPE_SECTOR_CHUNK (0x10)
-      * TYPE_ACK (0x11)
-      * TYPE_NAK (0x12)
-    y los reenvía por UART al RP2040 con el mismo framing.
-
-  - Web UI (HTTP en puerto 80, AP "XF551_MASTER" / "xf551wifi").
-*/
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -23,6 +5,10 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <stdarg.h>
+
+#ifndef ESP_IDF_VERSION_MAJOR
+#define ESP_IDF_VERSION_MAJOR 4
+#endif
 
 // ===== Protocol =====
 #define TYPE_CMD_FRAME    0x01
@@ -64,8 +50,7 @@ SlaveInfo slaves[4]; // D1..D4
 // Prefetch configurado por unidad
 uint8_t prefetchCfg[4] = {1, 1, 1, 1};
 
-// ========= Timings SIO (µs) – solo config (para futuro uso con RP) =========
-// Valores por defecto
+// ========= Timings SIO (µs) – config compartida con RP (por ahora solo NVS/UI) =========
 uint16_t T_ACK_TO_COMPLETE   = 600;
 uint16_t T_COMPLETE_TO_DATA  = 400;
 uint16_t T_DATA_TO_CHK       = 80;
@@ -76,16 +61,371 @@ WebServer server(80);
 Preferences prefs;
 const uint32_t CFG_MAGIC = 0xCAFEBABE;
 
-// ========= HTML UI (igual al que tienes) =========
+// ========= HTML UI sencillo =========
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
 <head>
- <!-- … (HTML idéntico al que ya tienes) … -->
+ <meta charset="UTF-8" />
+ <meta name="viewport" content="width=device-width, initial-scale=1" />
+ <title>XF551 WiFi - Panel</title>
+ <style>
+ :root {
+ --bg: #020617;
+ --accent: #38bdf8;
+ --accent-soft: rgba(56, 189, 248, 0.15);
+ --accent-strong: rgba(56, 189, 248, 0.45);
+ --text: #e5e7eb;
+ --text-soft: #9ca3af;
+ --border: #1f2937;
+ --danger: #f97373;
+ --ok: #4ade80;
+ }
+ * { box-sizing: border-box; }
+ body {
+ margin: 0;
+ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+ background: radial-gradient(circle at top left, #0f172a 0, #020617 40%, #000 100%);
+ color: var(--text);
+ }
+ .page { min-height: 100vh; padding: 12px; display: flex; flex-direction: column; align-items: center; }
+ .app { width: 100%; max-width: 960px; }
+ header { margin-bottom: 10px; text-align: center; }
+ header h1 { font-size: 1.4rem; margin: 4px 0; }
+ header p { font-size: 0.85rem; color: var(--text-soft); margin: 0; }
+ .grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+ @media (min-width: 700px) {
+ .grid { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
+ }
+ .card {
+ background: linear-gradient(135deg, rgba(15,23,42,0.96), rgba(15,23,42,0.9));
+ border-radius: 14px;
+ border: 1px solid var(--border);
+ box-shadow: 0 16px 40px rgba(15,23,42,0.8);
+ padding: 12px;
+ }
+ .card h2 { font-size: 1.1rem; margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
+ .card h2 span.icon {
+ display: inline-flex; width: 20px; height: 20px; border-radius: 999px;
+ align-items: center; justify-content: center;
+ background: var(--accent-soft); color: var(--accent); font-size: 0.9rem;
+ }
+ .card small { display: block; font-size: 0.75rem; color: var(--text-soft); margin-bottom: 6px; }
+ .drives-list { display: flex; flex-direction: column; gap: 6px; }
+ .drive-item {
+ border-radius: 10px; border: 1px solid var(--border);
+ padding: 8px; background: radial-gradient(circle at top left, rgba(15,23,42,0.9), #020617);
+ display: flex; flex-direction: column; gap: 4px;
+ }
+ .drive-header { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+ .drive-name { font-weight: 600; font-size: 0.95rem; }
+ .pill {
+ padding: 2px 8px; border-radius: 999px; font-size: 0.7rem;
+ border: 1px solid var(--border); background: rgba(15,23,42,0.9);
+ color: var(--text-soft); white-space: nowrap;
+ }
+ .pill.ok {
+ color: var(--ok); border-color: rgba(74,222,128,0.5); background: rgba(34,197,94,0.12);
+ }
+ .pill.bad {
+ color: var(--danger); border-color: rgba(248,113,113,0.6); background: rgba(248,113,113,0.12);
+ }
+ .drive-body { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 0.75rem; color: var(--text-soft); }
+ .drive-body span.label { color: var(--text-soft); }
+ .drive-body span.value { color: var(--text); font-weight: 500; }
+ .drive-prefetch {
+ margin-top: 4px; display: flex; align-items: center; justify-content: space-between;
+ gap: 6px; font-size: 0.75rem;
+ }
+ .switch { position: relative; display: inline-flex; align-items: center; cursor: pointer; gap: 4px; font-size: 0.75rem; }
+ .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+ .switch-slider {
+ width: 32px; height: 18px; background-color: #111827;
+ border-radius: 999px; border: 1px solid var(--border);
+ position: relative; transition: background-color 0.15s ease, border-color 0.15s ease;
+ }
+ .switch-slider::before {
+ content: ""; position: absolute; width: 14px; height: 14px; border-radius: 999px;
+ background-color: #f9fafb; left: 1px; top: 1px; transition: transform 0.15s ease;
+ box-shadow: 0 1px 2px rgba(0,0,0,0.5);
+ }
+ .switch input:checked + .switch-slider {
+ background-color: var(--accent-strong); border-color: rgba(56,189,248,0.8);
+ }
+ .switch input:checked + .switch-slider::before { transform: translateX(14px); }
+ .small-input {
+ width: 66px; padding: 4px 6px; border-radius: 6px;
+ border: 1px solid var(--border); background: #020617;
+ color: var(--text); font-size: 0.75rem;
+ }
+ .small-input:focus {
+ outline: none; border-color: var(--accent); box-shadow: 0 0 0 1px rgba(56,189,248,0.5);
+ }
+ .timing-grid {
+ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+ gap: 6px; margin-top: 8px;
+ }
+ @media (min-width: 700px) {
+ .timing-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+ }
+ .timing-item {
+ background: rgba(15,23,42,0.85); border-radius: 8px;
+ border: 1px solid var(--border); padding: 6px; font-size: 0.75rem;
+ }
+ .timing-item label { display: block; margin-bottom: 2px; color: var(--text-soft); }
+ .timing-item input {
+ width: 100%; padding: 4px 6px; border-radius: 6px;
+ border: 1px solid var(--border); background: #020617;
+ color: var(--text); font-size: 0.8rem;
+ }
+ .timing-item input:focus {
+ outline: none; border-color: var(--accent); box-shadow: 0 0 0 1px rgba(56,189,248,0.5);
+ }
+ .actions { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+ button {
+ border: none; border-radius: 999px; padding: 8px 14px;
+ font-size: 0.8rem; font-weight: 500; cursor: pointer;
+ display: inline-flex; align-items: center; gap: 6px;
+ background: radial-gradient(circle at top left, #0ea5e9, #0369a1);
+ color: #f9fafb; box-shadow: 0 10px 25px rgba(8,47,73,0.9);
+ transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+ }
+ button:hover {
+ transform: translateY(-1px); filter: brightness(1.05);
+ box-shadow: 0 12px 28px rgba(8,47,73,0.9);
+ }
+ button:active { transform: translateY(0); box-shadow: 0 6px 18px rgba(8,47,73,0.9); }
+ button.secondary {
+ background: radial-gradient(circle at top left, #111827, #020617);
+ color: var(--text-soft); box-shadow: none; border: 1px solid var(--border);
+ }
+ .status-line {
+ margin-top: 8px; font-size: 0.75rem; color: var(--text-soft);
+ display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+ }
+ .status-dot {
+ width: 8px; height: 8px; border-radius: 999px;
+ background: #4ade80; box-shadow: 0 0 0 5px rgba(74,222,128,0.15);
+ }
+ .status-dot.err {
+ background: #f97373; box-shadow: 0 0 0 5px rgba(248,113,113,0.18);
+ }
+ .status-msg { flex: 1; min-width: 0; }
+ .footer { margin-top: 10px; text-align: center; font-size: 0.7rem; color: var(--text-soft); opacity: 0.7; }
+ </style>
 </head>
 <body>
- <!-- … (contenido HTML y JS de tu panel) … -->
+ <div class="page">
+ <div class="app">
+ <header>
+ <h1>XF551 WiFi · Panel Maestro</h1>
+ <p>Estado de disqueteras · Tiempos SIO · Prefetch remoto (bridge)</p>
+ </header>
+
+ <div class="grid">
+ <!-- Columna izquierda: Disqueteras -->
+ <section class="card">
+ <h2><span class="icon">💾</span> Disqueteras</h2>
+ <small>Toca una unidad para ver su MAC, densidad y prefetch.</small>
+ <div id="drives" class="drives-list"></div>
+ </section>
+
+ <!-- Columna derecha: Configuración -->
+ <section class="card">
+ <h2><span class="icon">⚙️</span> Configuración avanzada</h2>
+ <small>Tiempos SIO (guardados en NVS) y prefetch por unidad.</small>
+
+ <div class="timing-grid">
+ <div class="timing-item">
+ <label for="ackToComplete">ACK → COMPLETE</label>
+ <input type="number" id="ackToComplete" min="200" step="50" />
+ </div>
+ <div class="timing-item">
+ <label for="completeToData">COMPLETE → DATA</label>
+ <input type="number" id="completeToData" min="200" step="50" />
+ </div>
+ <div class="timing-item">
+ <label for="dataToChk">DATA → CHK</label>
+ <input type="number" id="dataToChk" min="50" step="50" />
+ </div>
+ <div class="timing-item">
+ <label for="chunkDelay">Delay entre sectores</label>
+ <input type="number" id="chunkDelay" min="200" step="50" />
+ </div>
+ </div>
+
+ <div class="actions">
+ <button id="btnSave">💾 Guardar configuración</button>
+ <button id="btnReload" class="secondary">🔄 Recargar estado</button>
+ </div>
+
+ <div class="status-line">
+ <div id="statusDot" class="status-dot"></div>
+ <div id="statusMsg" class="status-msg">Listo.</div>
+ </div>
+ </section>
+ </div>
+
+ <div class="footer">
+ ESP32 Master Bridge · XF551 WiFi · V1.1
+ </div>
+ </div>
+ </div>
+
+ <script>
+ function $(id) { return document.getElementById(id); }
+
+ function setStatus(msg, ok = true) {
+ const dot = $("statusDot");
+ const text = $("statusMsg");
+ text.textContent = msg;
+ if (ok) dot.classList.remove("err");
+ else dot.classList.add("err");
+ }
+
+ function renderDrives(drives) {
+ const container = $("drives");
+ container.innerHTML = "";
+ if (!drives || drives.length === 0) {
+ container.innerHTML = "<small>No hay disqueteras registradas aún.</small>";
+ return;
+ }
+ drives.forEach(d => {
+ const div = document.createElement("div");
+ div.className = "drive-item";
+ const present = !!d.present;
+ const supports256 = !!d.supports256;
+ const prefetch = !!d.prefetch;
+ const prefetchSectors = d.prefetchSectors || 0;
+ const mac = d.mac || "—";
+
+ div.innerHTML = `
+ <div class="drive-header">
+ <div class="drive-name">${d.dev || "DX"}</div>
+ <div style="display:flex; gap:4px; align-items:center;">
+ <span class="pill ${present ? "ok" : "bad"}">${present ? "ONLINE" : "OFFLINE"}</span>
+ <span class="pill">${supports256 ? "DD 256B" : "SD 128B"}</span>
+ </div>
+ </div>
+ <div class="drive-body">
+ <div><span class="label">MAC: </span><span class="value">${mac}</span></div>
+ <div><span class="label">Prefetch: </span><span class="value">${prefetch ? "Sí" : "No"}</span></div>
+ <div><span class="label">Sectores pref.: </span><span class="value">${prefetchSectors}</span></div>
+ </div>
+ <div class="drive-prefetch">
+ <label class="switch">
+ <input type="checkbox" data-dev="${d.dev}" class="pf-toggle" ${prefetch ? "checked" : ""}>
+ <span class="switch-slider"></span>
+ </label>
+ <div style="display:flex; align-items:center; gap:4px;">
+ <span style="font-size:0.75rem;">Sectores:</span>
+ <input
+ type="number"
+ min="0"
+ max="16"
+ step="1"
+ value="${prefetchSectors}"
+ class="small-input pf-count"
+ data-dev="${d.dev}"
+ />
+ </div>
+ </div>
+ `;
+ container.appendChild(div);
+ });
+ }
+
+ async function loadStatus() {
+ try {
+ setStatus("Cargando estado...", true);
+ const res = await fetch("/api/status");
+ if (!res.ok) throw new Error("HTTP " + res.status);
+ const data = await res.json();
+
+ renderDrives(data.drives || []);
+
+ if (data.timings) {
+ $("ackToComplete").value = data.timings.ackToComplete ?? "";
+ $("completeToData").value = data.timings.completeToData ?? "";
+ $("dataToChk").value = data.timings.dataToChk ?? "";
+ $("chunkDelay").value = data.timings.chunkDelay ?? "";
+ }
+ setStatus("Estado actualizado.");
+ } catch (e) {
+ console.error(e);
+ setStatus("Error al obtener estado: " + e.message, false);
+ }
+ }
+
+ function collectConfig() {
+ const drives = [];
+ document.querySelectorAll(".drive-item").forEach(div => {
+ const dev = div.querySelector(".drive-name").textContent.trim();
+ const toggle = div.querySelector(".pf-toggle");
+ const inputCount = div.querySelector(".pf-count");
+ let sectors = inputCount ? Number(inputCount.value) || 0 : 0;
+ if (!toggle.checked) sectors = 0;
+ drives.push({ dev, prefetch: sectors > 0, prefetchSectors: sectors });
+ });
+
+ const timings = {
+ ackToComplete: Number($("ackToComplete").value) || 0,
+ completeToData: Number($("completeToData").value) || 0,
+ dataToChk: Number($("dataToChk").value) || 0,
+ chunkDelay: Number($("chunkDelay").value) || 0
+ };
+
+ return { drives, timings };
+ }
+
+ function mapPrefetchByDev(drives) {
+ const out = { D1: 0, D2: 0, D3: 0, D4: 0 };
+ drives.forEach(d => {
+ const dev = d.dev;
+ if (out.hasOwnProperty(dev)) {
+ out[dev] = d.prefetchSectors || 0;
+ }
+ });
+ return out;
+ }
+
+ async function saveConfig() {
+  try {
+    const cfg = collectConfig();
+    const pf = mapPrefetchByDev(cfg.drives);
+
+    setStatus("Guardando configuración...", true);
+
+    const urlTiming =
+      `/set_timing?t_ack=${cfg.timings.ackToComplete}` +
+      `&t_comp=${cfg.timings.completeToData}` +
+      `&t_chk=${cfg.timings.dataToChk}` +
+      `&t_chunk=${cfg.timings.chunkDelay}`;
+
+    const urlPrefetch =
+      `/set_prefetch?pf1=${pf.D1}&pf2=${pf.D2}&pf3=${pf.D3}&pf4=${pf.D4}`;
+
+    const r1 = await fetch(urlTiming);
+    if (!r1.ok) throw new Error("Error en /set_timing (" + r1.status + ")");
+
+    const r2 = await fetch(urlPrefetch);
+    if (!r2.ok) throw new Error("Error en /set_prefetch (" + r2.status + ")");
+
+    setStatus("Configuración guardada. Recargando estado...");
+    await loadStatus();
+  } catch (e) {
+    console.error(e);
+    setStatus("Error al guardar configuración: " + e.message, false);
+  }
+ }
+
+ document.addEventListener("DOMContentLoaded", () => {
+ $("btnReload").addEventListener("click", loadStatus);
+ $("btnSave").addEventListener("click", saveConfig);
+ loadStatus();
+ });
+ </script>
 </body>
 </html>
 )rawliteral";
@@ -99,17 +439,6 @@ void logf(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
   Serial.println(buf);
-}
-
-void logHex(const char* prefix, const uint8_t* data, int len, int maxBytes = 16) {
-  Serial.print(prefix);
-  int n = (len < maxBytes) ? len : maxBytes;
-  for (int i = 0; i < n; i++) {
-    Serial.print(' ');
-    if (data[i] < 0x10) Serial.print('0');
-    Serial.print(data[i], HEX);
-  }
-  Serial.println();
 }
 
 uint8_t calcChecksum(const uint8_t* buf, int len) {
@@ -252,23 +581,109 @@ void loadConfigFromNvs(){
        prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
 }
 
-// ========= Web Handlers (idénticos a los que ya usas) =========
+// ========= Web Handlers =========
 
 void handleRoot(){
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleApiStatus(){
-  // … igual que tu versión actual …
+  // Construimos JSON a mano para que calce con la página original
+  String json = "{";
+
+  // ---- drives ----
+  json += "\"drives\":[";
+  bool first = true;
+  for (int i = 0; i < 4; i++) {
+    uint8_t devCode = DEV_MIN + i; // 0x31..0x34
+    const char* name = devName(devCode);
+
+    if (!first) json += ",";
+    first = false;
+
+    bool present     = slaves[i].present;
+    bool supports256 = slaves[i].supports256;
+    uint8_t pf       = prefetchCfg[i];
+    String macStr    = formatMac(slaves[i].mac);
+    unsigned long lastSeen = slaves[i].lastSeen;  // millis() en el momento del último HELLO
+
+    json += "{";
+    json += "\"dev\":\"" + String(name) + "\",";
+    json += "\"present\":";     json += present ? "true" : "false";      json += ",";
+    json += "\"supports256\":"; json += supports256 ? "true" : "false";  json += ",";
+    json += "\"prefetch\":";    json += (pf > 0 ? "true" : "false");     json += ",";
+    json += "\"prefetchSectors\":" + String((int)pf) + ",";
+    json += "\"mac\":\"" + macStr + "\",";
+    json += "\"lastSeen\":" + String(lastSeen);
+    json += "}";
+  }
+  json += "],";
+
+  // ---- timings ----
+  json += "\"timings\":{";
+  json += "\"ackToComplete\":"  + String((int)T_ACK_TO_COMPLETE)   + ",";
+  json += "\"completeToData\":" + String((int)T_COMPLETE_TO_DATA)  + ",";
+  json += "\"dataToChk\":"      + String((int)T_DATA_TO_CHK)       + ",";
+  json += "\"chunkDelay\":"     + String((int)T_CHUNK_DELAY);
+  json += "}";
+
+  json += "}";
+
+  server.send(200, "application/json", json);
 }
+
 
 void handleSetTiming(){
-  // … igual que tu versión actual …
+  // Tomamos los valores que vengan, si faltan dejamos los actuales
+  if (server.hasArg("t_ack")) {
+    T_ACK_TO_COMPLETE = (uint16_t) server.arg("t_ack").toInt();
+  }
+  if (server.hasArg("t_comp")) {
+    T_COMPLETE_TO_DATA = (uint16_t) server.arg("t_comp").toInt();
+  }
+  if (server.hasArg("t_chk")) {
+    T_DATA_TO_CHK = (uint16_t) server.arg("t_chk").toInt();
+  }
+  // La página usa t_chunk -> lo mapeamos a T_CHUNK_DELAY
+  if (server.hasArg("t_chunk")) {
+    T_CHUNK_DELAY = (uint16_t) server.arg("t_chunk").toInt();
+  }
+
+  // Guardar en NVS con tus funciones
+  saveTimingConfigToNvs();
+
+  logf("[WEB] /set_timing: t_ack=%u t_comp=%u t_chk=%u t_chunk=%u",
+       T_ACK_TO_COMPLETE, T_COMPLETE_TO_DATA, T_DATA_TO_CHK, T_CHUNK_DELAY);
+
+  server.send(200, "text/plain", "OK");
 }
 
+
 void handleSetPrefetch(){
-  // … igual que tu versión actual …
+  int pf1 = server.hasArg("pf1") ? server.arg("pf1").toInt() : prefetchCfg[0];
+  int pf2 = server.hasArg("pf2") ? server.arg("pf2").toInt() : prefetchCfg[1];
+  int pf3 = server.hasArg("pf3") ? server.arg("pf3").toInt() : prefetchCfg[2];
+  int pf4 = server.hasArg("pf4") ? server.arg("pf4").toInt() : prefetchCfg[3];
+
+  auto clampPf = [](int v)->uint8_t {
+    if (v < 0) v = 0;
+    if (v > MAX_PREFETCH_SECTORS) v = MAX_PREFETCH_SECTORS;
+    return (uint8_t)v;
+  };
+
+  prefetchCfg[0] = clampPf(pf1);
+  prefetchCfg[1] = clampPf(pf2);
+  prefetchCfg[2] = clampPf(pf3);
+  prefetchCfg[3] = clampPf(pf4);
+
+  savePrefetchConfigToNvs();
+
+  logf("[WEB] /set_prefetch: D1=%u D2=%u D3=%u D4=%u",
+       prefetchCfg[0], prefetchCfg[1], prefetchCfg[2], prefetchCfg[3]);
+
+  server.send(200, "text/plain", "OK");
 }
+
 
 // ===== UART TX -> RP2040 =====
 void sendUartFrameToRP(const uint8_t* payload, uint8_t len) {
@@ -338,56 +753,55 @@ void pollUartFromRP() {
 
           switch (type) {
             case TYPE_CMD_FRAME: {
-  if (uartLen >= 7) {
-    uint8_t cmd  = uartBuf[1];
-    uint8_t dev  = uartBuf[2];
-    uint8_t base = cmd & 0x7F;
+              if (uartLen >= 7) {
+                uint8_t cmd  = uartBuf[1];
+                uint8_t dev  = uartBuf[2];
+                uint8_t base = cmd & 0x7F;
 
-    // Prefetch override
-    uint8_t pf  = prefetchForDev(dev);
-    if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
-    if (pf > 0) {
-      uartBuf[6] = pf;
-      logf("[MASTER] Overwrite PREFETCH para %s = %u sectores",
-           devName(dev), pf);
-    }
+                // Prefetch override
+                uint8_t pf  = prefetchForDev(dev);
+                if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
+                if (pf > 0) {
+                  uartBuf[6] = pf;
+                  logf("[MASTER] Overwrite PREFETCH para %s = %u sectores",
+                       devName(dev), pf);
+                }
 
-    // Log específico de FORMAT
-    if (base == 0x21) {
-      logf("[MASTER] FORMAT SD (0x21) dev=%s", devName(dev));
-    } else if (base == 0x22) {
-      logf("[MASTER] FORMAT DD (0x22) dev=%s", devName(dev));
-    }
+                // Log específico de FORMAT
+                if (base == 0x21) {
+                  logf("[MASTER] FORMAT SD (0x21) dev=%s", devName(dev));
+                } else if (base == 0x22) {
+                  logf("[MASTER] FORMAT DD (0x22) dev=%s", devName(dev));
+                }
 
-    // Detectar WRITE pendiente
-    bool isWriteSector = (base == 0x50 || base == 0x57);
-    bool isWritePercom = (base == 0x4F);
+                // Detectar WRITE pendiente
+                bool isWriteSector = (base == 0x50 || base == 0x57);
+                bool isWritePercom = (base == 0x4F);
 
-    if (isWriteSector || isWritePercom) {
-      uint16_t sec;
-      if (isWritePercom) {
-        sec = 0xFFFF;
-      } else {
-        sec = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
-      }
+                if (isWriteSector || isWritePercom) {
+                  uint16_t sec;
+                  if (isWritePercom) {
+                    sec = 0xFFFF;
+                  } else {
+                    sec = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
+                  }
 
-      g_pendingWriteRP.active = true;
-      g_pendingWriteRP.dev    = dev;
-      g_pendingWriteRP.sec    = sec;
-      logf("[MASTER] WRITE pendiente desde RP dev=%s sec=%u base=0x%02X",
-           devName(dev), (unsigned)sec, (unsigned)base);
-    }
-  }
+                  g_pendingWriteRP.active = true;
+                  g_pendingWriteRP.dev    = dev;
+                  g_pendingWriteRP.sec    = sec;
+                  logf("[MASTER] WRITE pendiente desde RP dev=%s sec=%u base=0x%02X",
+                       devName(dev), (unsigned)sec, (unsigned)base);
+                }
+              }
 
-  // Reenviar comando al SLAVE
-  sendEspToSlave(uartBuf, uartLen);
-  Serial.print(F("[MASTER] Enviado payload a SLAVE tipo=0x"));
-  if (uartBuf[0] < 0x10) Serial.print('0');
-  Serial.print(uartBuf[0], HEX);
-  Serial.print(F(" len="));
-  Serial.println(uartLen);
-} break;
-
+              // Reenviar comando al SLAVE
+              sendEspToSlave(uartBuf, uartLen);
+              Serial.print(F("[MASTER] Enviado payload a SLAVE tipo=0x"));
+              if (uartBuf[0] < 0x10) Serial.print('0');
+              Serial.print(uartBuf[0], HEX);
+              Serial.print(F(" len="));
+              Serial.println(uartLen);
+            } break;
 
             case TYPE_SECTOR_CHUNK: {
               if (uartLen < 6) {
