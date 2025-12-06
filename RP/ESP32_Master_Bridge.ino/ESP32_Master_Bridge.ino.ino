@@ -508,6 +508,16 @@ struct PendingWriteFromRP {
 
 PendingWriteFromRP g_pendingWriteRP = { false, 0, 0 };
 
+// ========= NUEVO: último comando importante (READ/WRITE/FORMAT/STATUS/PERCOM) =========
+struct LastMasterOp {
+  bool    active;
+  uint8_t cmd;   // comando SIO original (0x52, 0x50, 0x21, etc.)
+  uint8_t dev;   // 0x31..0x34
+  uint16_t sec;  // sector lógico (o 0/0xFFFF según cmd)
+};
+
+LastMasterOp g_lastMasterOp = { false, 0, 0, 0 };
+
 // ========= NVS: cargar/guardar =========
 
 void saveTimingConfigToNvs(){
@@ -758,6 +768,11 @@ void pollUartFromRP() {
                 uint8_t dev  = uartBuf[2];
                 uint8_t base = cmd & 0x7F;
 
+                // Sector lógico y flags (comparten layout para READ/WRITE)
+                uint16_t sec     = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
+                uint8_t densFlag = uartBuf[5]; // 0=SD, 1=DD (según RP)
+                uint8_t pfReq    = uartBuf[6]; // prefetch pedido por RP
+
                 // Prefetch override
                 uint8_t pf  = prefetchForDev(dev);
                 if (pf > MAX_PREFETCH_SECTORS) pf = MAX_PREFETCH_SECTORS;
@@ -765,6 +780,17 @@ void pollUartFromRP() {
                   uartBuf[6] = pf;
                   logf("[MASTER] Overwrite PREFETCH para %s = %u sectores",
                        devName(dev), pf);
+                }
+
+                // Log específico de READ
+                if (base == 0x52) {
+                  logf("[MASTER] READ lógico dev=%s (0x%02X) sec=%u dens=%s pfReq=%u pfCfg=%u",
+                       devName(dev),
+                       (unsigned)dev,
+                       (unsigned)sec,
+                       densFlag ? "DD" : "SD",
+                       (unsigned)pfReq,
+                       (unsigned)pf);
                 }
 
                 // Log específico de FORMAT
@@ -779,19 +805,46 @@ void pollUartFromRP() {
                 bool isWritePercom = (base == 0x4F);
 
                 if (isWriteSector || isWritePercom) {
-                  uint16_t sec;
+                  uint16_t opSec;
                   if (isWritePercom) {
-                    sec = 0xFFFF;
+                    opSec = 0xFFFF;
                   } else {
-                    sec = (uint16_t)uartBuf[3] | ((uint16_t)uartBuf[4] << 8);
+                    opSec = sec;
                   }
 
                   g_pendingWriteRP.active = true;
                   g_pendingWriteRP.dev    = dev;
-                  g_pendingWriteRP.sec    = sec;
+                  g_pendingWriteRP.sec    = opSec;
                   logf("[MASTER] WRITE pendiente desde RP dev=%s sec=%u base=0x%02X",
-                       devName(dev), (unsigned)sec, (unsigned)base);
+                       devName(dev),
+                       (unsigned)opSec,
+                       (unsigned)base);
                 }
+
+                // ====== NUEVO: registrar último comando importante ======
+                bool isRead       = (base == 0x52);
+                bool isFormatSD   = (base == 0x21);
+                bool isFormatDD   = (base == 0x22);
+                bool isStatus     = (base == 0x53);
+                bool isReadPercom = (base == 0x4E);
+                bool isWritePer   = isWritePercom;
+                bool isWriteSecOp = isWriteSector;
+
+                g_lastMasterOp.active = (isRead || isWriteSecOp || isWritePer ||
+                                         isFormatSD || isFormatDD || isStatus || isReadPercom);
+                if (g_lastMasterOp.active) {
+                  g_lastMasterOp.cmd = cmd;
+                  g_lastMasterOp.dev = dev;
+
+                  if (isRead || isWriteSecOp) {
+                    g_lastMasterOp.sec = sec;
+                  } else if (isWritePer || isReadPercom) {
+                    g_lastMasterOp.sec = 0xFFFF;
+                  } else {
+                    g_lastMasterOp.sec = 0;
+                  }
+                }
+                // ====== FIN NUEVO ======
               }
 
               // Reenviar comando al SLAVE
@@ -918,7 +971,26 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t* data, int len) {
 
     sendUartFrameToRP(data, len);
   }
-  else if (type == TYPE_SECTOR_CHUNK || type == TYPE_ACK || type == TYPE_NAK) {
+  else if (type == TYPE_SECTOR_CHUNK) {
+    // Sector data desde SLAVE → RP
+    sendUartFrameToRP(data, len);
+  }
+  else if (type == TYPE_ACK || type == TYPE_NAK) {
+    const char* kind = (type == TYPE_ACK) ? "ACK" : "NAK";
+
+    if (g_lastMasterOp.active) {
+      logf("[MASTER] %s desde SLAVE para cmd=0x%02X dev=%s sec=%u",
+           kind,
+           (unsigned)g_lastMasterOp.cmd,
+           devName(g_lastMasterOp.dev),
+           (unsigned)g_lastMasterOp.sec);
+    } else {
+      logf("[MASTER] %s desde SLAVE (sin op activa)", kind);
+    }
+
+    // después de ACK/NAK, limpiamos la op activa
+    g_lastMasterOp.active = false;
+
     sendUartFrameToRP(data, len);
   }
 }

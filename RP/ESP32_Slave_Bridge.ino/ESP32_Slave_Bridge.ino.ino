@@ -39,7 +39,7 @@ HardwareSerial SerialSIO(2);
 #define MAX_PREFETCH_SECTORS 6
 
 const uint8_t DEVICE_ID   = 0x31; // D1
-const bool    supports256 = true; // XF551 DD
+const bool    supports256 = false; // XF551 DD
 
 const uint8_t BCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
